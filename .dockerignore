@@ -1,0 +1,5 @@
+**
+!docker/
+!docker/voxtream2-ru/
+!docker/voxtream2-ru/Dockerfile
+!docker/voxtream2-ru/requirements.lock

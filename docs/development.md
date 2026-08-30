@@ -19,7 +19,22 @@ Engines собираются на целевом Jetson. План, собран�
 python3 tools/build_tensorrt_engine.py --help
 ```
 
-## 3. Быстрая проверка кода
+## 3. Runtime-образ без PyTorch
+
+Готовые engines запускаются в отдельном deployment-окружении. PyTorch там не
+установлен и нужен только офлайн-экспортёрам из предыдущего шага.
+
+```bash
+docker build \
+  -t voxtream2-ru-jetson:runtime \
+  -f docker/voxtream2-ru/Dockerfile \
+  .
+```
+
+Полная инструкция и проверка отсутствия PyTorch находятся в
+[`docker/voxtream2-ru/README.md`](../docker/voxtream2-ru/README.md).
+
+## 4. Быстрая проверка кода
 
 ```bash
 python3 -m compileall -q src tools experiments
@@ -28,7 +43,7 @@ PYTHONPATH=src python3 -m voxtream2_ru_jetson --help
 
 Вторая команда требует Jetson-окружение с TensorRT и CUDA Python.
 
-## 4. Генерация
+## 5. Генерация
 
 После подготовки engines и assets runtime запускается как модуль:
 
@@ -50,7 +65,7 @@ PYTHONPATH=src python3 -m voxtream2_ru_jetson \
   --output output.wav
 ```
 
-## 5. Проверки перед принятием изменения
+## 6. Проверки перед принятием изменения
 
 1. Процесс не импортировал `torch`.
 2. ONNX/TensorRT прошли численное или побитовое сравнение с эталоном там, где

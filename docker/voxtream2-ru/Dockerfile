@@ -1,26 +1,23 @@
-# PyTorch 2.7 fixes the Jetson SDPA/CUDA Graph path used by VoXtream's
-# single-token autoregressive decode.  The older PyTorch 2.5 image routes that
-# shape through a cuDNN attention path which fails during graph capture.
-ARG BASE_IMAGE=dustynv/pytorch:2.7-r36.4.0
+# Official Jetson deployment image with CUDA 12.6 and TensorRT 10.3.  PyTorch
+# is deliberately absent: model export happens offline, outside this image.
+ARG BASE_IMAGE=nvcr.io/nvidia/l4t-tensorrt:r10.3.0-runtime
 FROM ${BASE_IMAGE}
 
-# VoXtream2-RU vendors its inference code with the model.  This image only
-# supplies the compatible Jetson CUDA runtime and Python/system dependencies.
+# The runtime writes PCM with Python's wave module.  Only espeak-ng is needed
+# from the former audio/build dependency set.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    build-essential \
-    cargo \
+    ca-certificates \
     espeak-ng \
-    libasound2-dev \
-    libopus-dev \
-    libsndfile1 \
-    pkg-config \
-    rustc \
     && rm -rf /var/lib/apt/lists/*
 
-COPY docker/voxtream2-ru/requirements.txt /tmp/voxtream2-ru-requirements.txt
-# Some Jetson base images inject NVIDIA's optional PyPI mirror.  Keep this
-# runtime build deterministic and avoid long DNS retries when that mirror is
-# unavailable; every dependency below is available from the primary index.
-ENV PIP_EXTRA_INDEX_URL=https://pypi.org/simple
+COPY docker/voxtream2-ru/requirements.lock /tmp/voxtream2-ru-requirements.lock
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1
 RUN python3 -m pip install --no-cache-dir --index-url https://pypi.org/simple \
-    -r /tmp/voxtream2-ru-requirements.txt
+    -r /tmp/voxtream2-ru-requirements.lock
+
+# TensorRT itself is imported after launch with `--runtime nvidia`, which
+# mounts Jetson platform libraries such as libnvdla_compiler.so.
+RUN python3 -m pip check \
+    && python3 -c "import importlib.util as u; blocked = ('torch', 'torchaudio', 'torchvision', 'torchao', 'torchtune'); assert all(u.find_spec(name) is None for name in blocked); assert u.find_spec('tensorrt') is not None; import numpy, onnxruntime; from cuda import cudart"
