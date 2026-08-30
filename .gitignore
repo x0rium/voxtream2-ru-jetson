@@ -1,0 +1,40 @@
+# OS and editor state
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Generated model and runtime assets
+*.bin
+*.cubin
+*.engine
+*.onnx
+*.plan
+*.pt
+*.pth
+*.safetensors
+*.wav
+*.mp3
+models/
+outputs/
+cache/
+
+# The research archive stays on the workstation. Public results belong in docs.
+artifacts/**
+!artifacts/README.md

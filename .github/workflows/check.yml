@@ -1,0 +1,22 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+      - name: Install check dependencies
+        run: python -m pip install "numpy<2" "ruff==0.15.17"
+      - name: Lint
+        run: ruff check src tools experiments tests
+      - name: Compile
+        run: python -m compileall -q src tools experiments tests
+      - name: Unit tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -v

@@ -1,0 +1,29 @@
+diff --git a/demo/voxtream/model.py b/demo/voxtream/model.py
+--- a/demo/voxtream/model.py
++++ b/demo/voxtream/model.py
+@@ -326,6 +326,6 @@ class Model(nn.Module):
+                 ).to(dtype=dtype)
+ 
+-            ci_logits = torch.mm(dep_former_h[:, -1, :], self.audio_head[i - 1])
++            ci_logits = self.project_acoustic_logits(dep_former_h, i - 1)
+             ci_sample = sample_acoustic_token(
+                 logits=ci_logits,
+                 temperature=config.temperature,
+@@ -341,6 +341,17 @@ class Model(nn.Module):
+ 
+         return frame, pred_shift, cur_spk_rate_cnt
+ 
++    def project_acoustic_logits(
++        self, dep_former_h: torch.Tensor, head_index: int
++    ) -> torch.Tensor:
++        """Use a backend-fused head when available, otherwise keep PyTorch."""
++        fused_logits = getattr(self.dep_former, "acoustic_logits", None)
++        if fused_logits is not None:
++            return fused_logits
++        return torch.mm(
++            dep_former_h[:, -1, :], self.audio_head[head_index]
++        )
++
+     def _temp_former(
+         self,
+         h: torch.Tensor,
