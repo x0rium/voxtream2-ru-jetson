@@ -27,6 +27,7 @@ from cuda import cudart
 from .cuda_acoustic_control import CudaAcousticControl
 from .cuda_audio_embedding import CudaAudioEmbeddingCore
 from .frontend import TorchlessRussianFrontend
+from .sink_attention import SinkAttentionConfig, SinkAttentionHistory
 from .tensorrt_standalone import CudaArena, cuda_check
 
 
@@ -237,12 +238,21 @@ class TempDecoder:
         self.state_names = tuple(bundle.manifest["prefill_buffer_names"])
         self.state = {}
         self.initial = {}
+        self.empty_cache_pos = {}
         for name in self.state_names:
             value = np.ascontiguousarray(bundle.array(f"temp_state.{name}"))
             pointer = arena.allocate(max(value.nbytes, 1))
             copy_to_device(pointer, value)
-            self.state[sanitize_tensor_name(name)] = pointer
-            self.initial[sanitize_tensor_name(name)] = value
+            tensor_name = sanitize_tensor_name(name)
+            self.state[tensor_name] = pointer
+            self.initial[tensor_name] = value
+            if value.dtype == np.int64:
+                if not name.endswith("kv_cache.cache_pos"):
+                    raise TypeError(f"unexpected temporal int64 state: {name}")
+                empty = np.arange(value.size, dtype=np.int64).reshape(value.shape)
+                template = arena.allocate(max(empty.nbytes, 1))
+                copy_to_device(template, empty)
+                self.empty_cache_pos[tensor_name] = (template, empty.nbytes)
         self.hidden = arena.allocate(2 * 1 * 1024 * 2)
         self.position = arena.allocate(2 * 1 * 8)
         self.mask = arena.allocate(2 * 1 * 2048)
@@ -265,12 +275,49 @@ class TempDecoder:
         self.graph = None
         self.graph_exec = None
         self.graph_launches = 0
+        self.sink_rebuilds = 0
+        self.sink_replay_steps = 0
+        self.sink_rebuild_seconds = 0.0
+        config = bundle.manifest["config"]
+        self.audio_window_size = int(
+            config.get("audio_window_size", int(config["max_temp_position"]) + 1)
+        )
+        if "prefill.hidden" in bundle.specs:
+            self.sink_attention = SinkAttentionHistory(
+                SinkAttentionConfig(audio_window_size=self.audio_window_size),
+                bundle.array("prefill.hidden"),
+            )
+        else:
+            self.sink_attention = None
 
     def step(self, hidden_bf16: np.ndarray, position: int) -> tuple[np.ndarray, np.ndarray]:
-        if position > 624:
+        if self.sink_attention is None:
+            if position >= self.audio_window_size:
+                raise RuntimeError(
+                    "torchless assets do not contain prefill.hidden required for "
+                    "sink-attention cache rebuild"
+                )
+            local_position = position
+        else:
+            if self.sink_attention.needs_rebuild(position):
+                self._rebuild_cache(position)
+            local_position = self.sink_attention.local_position(position)
+        if local_position >= self.audio_window_size:
             raise RuntimeError(
-                "prototype has not implemented sink-attention cache compaction beyond position 624"
+                "sink-attention cache rebuild did not bring the position into its window"
             )
+        output, logits = self._execute(hidden_bf16, local_position, readback=True)
+        if self.sink_attention is not None:
+            self.sink_attention.append(hidden_bf16)
+        return output, logits
+
+    def _execute(
+        self,
+        hidden_bf16: np.ndarray,
+        position: int,
+        *,
+        readback: bool,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
         positions = np.full((2, 1), position, dtype=np.int64)
         mask = np.zeros((2, 1, 2048), dtype=np.bool_)
         mask[:, :, : position + 1] = True
@@ -287,14 +334,48 @@ class TempDecoder:
             raise RuntimeError("temp TensorRT enqueue failed")
         cuda_check(cudart.cudaStreamSynchronize(self.stream), "temp synchronize")
         self.calls += 1
-        return (
-            download_array(self.output, np.float32, (2, 1, 1024)),
-            download_array(self.logits, np.uint16, (2, 1, 12300)),
+        if not readback:
+            return None
+        return download_array(self.output, np.float32, (2, 1, 1024)), download_array(
+            self.logits, np.uint16, (2, 1, 12300)
         )
+
+    def _reset_empty_cache(self) -> None:
+        # Every visible K/V slot is overwritten by the replay. Keeping words in
+        # masked slots avoids copying 192 MiB only to clear them. cache_pos is
+        # the state that controls where each replayed token is written.
+        for name, (template, size) in self.empty_cache_pos.items():
+            cuda_check(
+                cudart.cudaMemcpy(
+                    self.state[name],
+                    template,
+                    size,
+                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
+                ),
+                f"cudaMemcpy(D2D reset {name})",
+            )
+
+    def _rebuild_cache(self, global_position: int) -> None:
+        if self.sink_attention is None:
+            raise RuntimeError("sink-attention history is unavailable")
+        started = time.perf_counter()
+        replay_hidden = self.sink_attention.rebuild_sequence(global_position)
+        self._reset_empty_cache()
+        for position in range(replay_hidden.shape[1]):
+            self._execute(
+                replay_hidden[:, position : position + 1],
+                position,
+                readback=False,
+            )
+        self.sink_rebuilds += 1
+        self.sink_replay_steps += int(replay_hidden.shape[1])
+        self.sink_rebuild_seconds += time.perf_counter() - started
 
     def reset(self) -> None:
         for name, value in self.initial.items():
             copy_to_device(self.state[name], value)
+        if self.sink_attention is not None:
+            self.sink_attention.reset()
 
     def capture_graph(self) -> None:
         if self.graph_exec is not None:
@@ -1183,6 +1264,9 @@ class SynthesisRuntime:
             call_start = {
                 "temp": self.temp.calls,
                 "temp_cuda_graph": self.temp.graph_launches,
+                "temp_sink_rebuilds": self.temp.sink_rebuilds,
+                "temp_sink_replay_steps": self.temp.sink_replay_steps,
+                "temp_sink_rebuild_seconds": self.temp.sink_rebuild_seconds,
                 "dep_q2": self.dep.calls[2],
                 "dep_q1": self.dep.calls[1],
                 "mimi": self.mimi.calls,
@@ -1389,6 +1473,9 @@ class SynthesisRuntime:
             calls = {
                 "temp": self.temp.calls - call_start["temp"],
                 "temp_cuda_graph": (self.temp.graph_launches - call_start["temp_cuda_graph"]),
+                "temp_sink_replay": (
+                    self.temp.sink_replay_steps - call_start["temp_sink_replay_steps"]
+                ),
                 "dep_q2": self.dep.calls[2] - call_start["dep_q2"],
                 "dep_q1": self.dep.calls[1] - call_start["dep_q1"],
                 "mimi": self.mimi.calls - call_start["mimi"],
@@ -1442,6 +1529,37 @@ class SynthesisRuntime:
                     for name, seconds in stage_seconds.items()
                 },
                 "calls": calls,
+                "sink_attention": {
+                    "enabled": self.temp.sink_attention is not None,
+                    "window_size": self.temp.audio_window_size,
+                    "prompt_length": (
+                        self.temp.sink_attention.prompt_length
+                        if self.temp.sink_attention is not None
+                        else None
+                    ),
+                    "tail_limit": (
+                        self.temp.sink_attention.tail_limit
+                        if self.temp.sink_attention is not None
+                        else None
+                    ),
+                    "position_offset": (
+                        self.temp.sink_attention.position_offset
+                        if self.temp.sink_attention is not None
+                        else None
+                    ),
+                    "rebuilds": (
+                        self.temp.sink_rebuilds - call_start["temp_sink_rebuilds"]
+                    ),
+                    "replay_steps": (
+                        self.temp.sink_replay_steps
+                        - call_start["temp_sink_replay_steps"]
+                    ),
+                    "rebuild_seconds": round(
+                        self.temp.sink_rebuild_seconds
+                        - call_start["temp_sink_rebuild_seconds"],
+                        3,
+                    ),
+                },
                 "teacher_forced": {
                     "enabled": teacher_force_reference,
                     "frames": len(teacher_forced_comparisons),

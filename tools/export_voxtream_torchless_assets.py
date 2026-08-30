@@ -209,6 +209,7 @@ def main() -> None:
     ).to(dtype=torch.bfloat16, device="cpu")
 
     writer = BundleWriter()
+    writer.add_tensor("prefill.hidden", prefill["hidden"])
     writer.add_tensor("prefill.output", prefill["output"])
     writer.add_tensor("prefill.semantic_logits", semantic_logits)
     for name, state in zip(prefill["buffer_names"], prefill["final_state"]):
@@ -259,6 +260,7 @@ def main() -> None:
             "sample_rate": 24000,
             "samples_per_frame": 1920,
             "audio_delay_frames": 1,
+            "audio_window_size": 625,
             "max_temp_position": 624,
             "phoneme_index_map": {
                 "0": [0, 1],
