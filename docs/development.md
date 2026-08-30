@@ -78,3 +78,31 @@ PYTHONPATH=src python3 -m voxtream2_ru_jetson \
 Разовые probes после завершения исследования остаются в `experiments/`, а
 выводы переносятся в документацию. Так не приходится угадывать, какой из
 десятков файлов является рабочим runtime.
+
+## 7. Резидентный запуск
+
+Для диалога создайте один `SynthesisRuntime` и вызывайте
+`synthesize_stream()` для каждой реплики. Runtime сбрасывает состояние
+генераторов, но не выгружает RUAccent, TensorRT engines и CUDA Graph.
+
+Готовый stdio-процесс запускается теми же аргументами путей, что и обычный
+runtime, но без `--text` и `--output`:
+
+```bash
+PYTHONPATH=src python3 -m voxtream2_ru_jetson.resident \
+  --assets /path/to/prompt-assets.json \
+  --ruaccent-assets /path/to/ruaccent \
+  --phone-map /path/to/phoneme_to_token.json \
+  --temp-engine /path/to/temp.engine \
+  --dep-engine /path/to/dep.engine \
+  --phone-engine /path/to/phone.engine \
+  --mimi-engine /path/to/mimi.engine \
+  --mimi-state /path/to/mimi-state.json \
+  --audio-embedding-weight /path/to/audio_embeddings.bf16 \
+  --audio-embedding-cubin /path/to/audio_embedding.cubin \
+  --cuda-acoustic-control-cubin /path/to/acoustic_control.cubin \
+  --cuda-dep-graph --cuda-temp-graph
+```
+
+Описание JSONL-запросов и бинарных PCM-записей находится в
+[`resident-runtime.md`](resident-runtime.md).

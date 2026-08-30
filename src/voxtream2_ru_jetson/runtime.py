@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Run one complete VoXtream2-RU utterance without importing PyTorch.
+"""Run VoXtream2-RU utterances without importing PyTorch.
 
 The acoustic prompt and its prefill cache are exported ahead of time. The text
 is supplied at runtime and passes through the framework-free Russian frontend.
+The resident API keeps the frontend and TensorRT engines loaded between turns.
 """
 
 from __future__ import annotations
 
 import argparse
-import gc
 import hashlib
 import json
 import re
@@ -16,6 +16,8 @@ import resource
 import sys
 import time
 import wave
+from collections.abc import Generator, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -181,9 +183,26 @@ class PhoneEncoder:
         self.context = self.owner.engine.create_execution_context()
         self.stream = stream
         self.arena = arena
+        profile_maxima = [
+            self.owner.engine.get_tensor_profile_shape("phone_tokens", index)[2]
+            for index in range(self.owner.engine.num_optimization_profiles)
+        ]
+        self.max_batch = max(int(shape[0]) for shape in profile_maxima)
+        self.max_sequence = max(int(shape[1]) for shape in profile_maxima)
+        self.pointers = {
+            "phone_tokens": arena.allocate(self.max_batch * self.max_sequence * 8),
+            "input_pos": arena.allocate(self.max_batch * self.max_sequence * 8),
+            "mask": arena.allocate(self.max_batch * self.max_sequence * self.max_sequence),
+            "phone_embeddings": arena.allocate(self.max_batch * self.max_sequence * 1024 * 2),
+        }
 
     def run(self, tokens: np.ndarray, look_ahead: int = 30) -> np.ndarray:
         batch, sequence = tokens.shape
+        if batch > self.max_batch or sequence > self.max_sequence:
+            raise ValueError(
+                "phone sequence exceeds TensorRT profile: "
+                f"{tokens.shape} > ({self.max_batch}, {self.max_sequence})"
+            )
         positions = np.repeat(np.arange(sequence, dtype=np.int64)[None], batch, axis=0)
         rows = positions[:, :, None]
         columns = np.arange(sequence, dtype=np.int64)[None, None]
@@ -193,20 +212,18 @@ class PhoneEncoder:
             "input_pos": positions,
             "mask": np.ascontiguousarray(mask, dtype=np.bool_),
         }
-        pointers = {name: self.arena.allocate(value.nbytes) for name, value in inputs.items()}
         for name, value in inputs.items():
             if not self.context.set_input_shape(name, tuple(value.shape)):
                 raise RuntimeError(f"failed to set phone shape {name}={value.shape}")
-            copy_to_device(pointers[name], value)
+            copy_to_device(self.pointers[name], value)
         output_shape = tuple(self.context.get_tensor_shape("phone_embeddings"))
-        output = self.arena.allocate(int(np.prod(output_shape)) * 2)
-        for name, pointer in {**pointers, "phone_embeddings": output}.items():
+        for name, pointer in self.pointers.items():
             if not self.context.set_tensor_address(name, pointer):
                 raise RuntimeError(f"failed to bind phone tensor {name}")
         if not self.context.execute_async_v3(self.stream):
             raise RuntimeError("phone TensorRT enqueue failed")
         cuda_check(cudart.cudaStreamSynchronize(self.stream), "phone synchronize")
-        return download_array(output, np.uint16, output_shape)
+        return download_array(self.pointers["phone_embeddings"], np.uint16, output_shape)
 
 
 class TempDecoder:
@@ -871,149 +888,358 @@ def update_frame_state(
     state.dwell_count = dwell
 
 
-def main() -> None:
-    args = parse_args()
-    metrics_path = args.metrics or args.output.with_suffix(".json")
-    if metrics_path.resolve() == args.assets.resolve():
-        raise ValueError(
-            "metrics path would overwrite the immutable asset manifest; "
-            "pass --metrics with a distinct path"
+@dataclass(frozen=True)
+class RuntimeFiles:
+    assets: Path
+    temp_engine: Path
+    dep_engine: Path
+    phone_engine: Path
+    mimi_engine: Path
+    mimi_state: Path
+    audio_embedding_weight: Path
+    audio_embedding_cubin: Path
+    cuda_acoustic_control_cubin: Path | None = None
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> "RuntimeFiles":
+        return cls(
+            assets=args.assets,
+            temp_engine=args.temp_engine,
+            dep_engine=args.dep_engine,
+            phone_engine=args.phone_engine,
+            mimi_engine=args.mimi_engine,
+            mimi_state=args.mimi_state,
+            audio_embedding_weight=args.audio_embedding_weight,
+            audio_embedding_cubin=args.audio_embedding_cubin,
+            cuda_acoustic_control_cubin=args.cuda_acoustic_control_cubin,
         )
-    if "torch" in sys.modules:
-        raise RuntimeError("PyTorch was imported before torchless runtime startup")
-    started = time.perf_counter()
-    bundle = RawBundle(args.assets)
-    config = bundle.manifest["config"]
-    frontend_metrics = None
-    frontend_result = None
-    if args.text is not None:
-        if args.teacher_force_reference:
-            raise ValueError("--teacher-force-reference cannot be used with --text")
-        if args.ruaccent_assets is None or args.phone_map is None:
-            raise ValueError("--text requires --ruaccent-assets and --phone-map")
-        frontend_started = time.perf_counter()
-        frontend = TorchlessRussianFrontend(
-            args.ruaccent_assets,
-            args.phone_map,
-            args.espeak_executable,
-            args.text_normalizer,
-        )
-        frontend_loaded = time.perf_counter()
-        prompt_len = int(bundle.manifest["prompt_phone_len"])
-        prompt_prefix = bundle.array("phone.tokens")[0, :prompt_len]
-        frontend_result = frontend.prepare(args.text, prompt_prefix)
-        frontend_finished = time.perf_counter()
-        if frontend_result.unknown_phones and not args.allow_unknown_phones:
-            raise ValueError(
-                "frontend produced phones outside the model vocabulary: "
-                f"{frontend_result.unknown_phones}"
+
+
+class SynthesisStream(Iterator[bytes]):
+    """One utterance as raw mono 24 kHz signed 16-bit PCM chunks."""
+
+    def __init__(
+        self,
+        iterator: Generator[bytes, None, dict[str, object]],
+        release,
+    ) -> None:
+        self._iterator = iterator
+        self._release = release
+        self.result: dict[str, object] | None = None
+        self.closed = False
+
+    def __iter__(self) -> "SynthesisStream":
+        return self
+
+    def __enter__(self) -> "SynthesisStream":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    def __next__(self) -> bytes:
+        if self.closed:
+            raise StopIteration
+        try:
+            return next(self._iterator)
+        except StopIteration as finished:
+            self.closed = True
+            self.result = finished.value
+            self._release()
+            raise
+        except BaseException:
+            self.closed = True
+            self._release()
+            raise
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self._iterator.close()
+        self._release()
+
+
+class SynthesisRuntime:
+    """Resident PyTorch-free frontend and TensorRT execution state."""
+
+    def __init__(
+        self,
+        files: RuntimeFiles,
+        *,
+        ruaccent_assets: Path | None = None,
+        phone_map: Path | None = None,
+        espeak_executable: str = "espeak-ng",
+        text_normalizer: str = "ru-normalizr",
+        cuda_temp_graph: bool = False,
+        cuda_dep_graph: bool = False,
+    ) -> None:
+        if "torch" in sys.modules:
+            raise RuntimeError("PyTorch was imported before torchless runtime startup")
+        if (ruaccent_assets is None) != (phone_map is None):
+            raise ValueError("ruaccent_assets and phone_map must be supplied together")
+
+        started = time.perf_counter()
+        self.files = files
+        self.bundle = RawBundle(files.assets)
+        self.config = self.bundle.manifest["config"]
+        self.frontend = None
+        self.frontend_load_seconds = 0.0
+        if ruaccent_assets is not None and phone_map is not None:
+            frontend_started = time.perf_counter()
+            self.frontend = TorchlessRussianFrontend(
+                ruaccent_assets,
+                phone_map,
+                espeak_executable,
+                text_normalizer,
             )
-        frontend_metrics = {
-            "backend": f"{args.text_normalizer}+ruaccent-onnx+espeak-ng",
-            "normalized_text": frontend_result.normalized_text,
-            "accented_text": frontend_result.accented_text,
-            "phonemes": frontend_result.phonemes,
-            "unknown_phones": list(frontend_result.unknown_phones),
-            "phone_tokens_shape": list(frontend_result.phone_tokens.shape),
-            "phone_seq_len": frontend_result.phone_seq_len,
-            "load_seconds": round(frontend_loaded - frontend_started, 3),
-            "process_seconds": round(frontend_finished - frontend_loaded, 3),
-            "peak_rss_mib": round(
-                resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1
-            ),
-        }
-        del frontend
-        gc.collect()
+            self.frontend_load_seconds = time.perf_counter() - frontend_started
         if "torch" in sys.modules:
             raise RuntimeError("PyTorch entered sys.modules through the text frontend")
-    stream_handle = cuda_check(cudart.cudaStreamCreate(), "cudaStreamCreate")
-    stream = int(stream_handle)
-    arena = CudaArena()
-    embeddings = None
-    acoustic_control = None
-    temp = None
-    dep = None
-    trajectory: list[dict[str, object]] = []
-    teacher_forced_comparisons: list[dict[str, object]] = []
-    frame_times: list[float] = []
-    stage_seconds = {
-        "temp_input": 0.0,
-        "temp_engine": 0.0,
-        "semantic_and_q2_input": 0.0,
-        "dep_frame": 0.0,
-        "mimi": 0.0,
-    }
-    audio_frames = 0
-    first_audio_seconds = None
-    first_audio_wall_seconds = None
-    try:
-        phone = PhoneEncoder(args.phone_engine, stream, arena)
-        temp = TempDecoder(args.temp_engine, bundle, stream, arena)
-        dep = DepDecoder(args.dep_engine, stream, arena)
-        mimi = MimiDecoder(args.mimi_engine, args.mimi_state, stream, arena)
-        embeddings = AudioEmbeddings(
-            args.audio_embedding_weight,
-            args.audio_embedding_cubin,
-            stream,
-            arena,
-        )
-        if args.cuda_acoustic_control_cubin is not None:
-            acoustic_control = CudaAcousticControl(
-                args.cuda_acoustic_control_cubin
+
+        self.stream_handle = cuda_check(cudart.cudaStreamCreate(), "cudaStreamCreate")
+        self.cuda_stream = int(self.stream_handle)
+        self.arena = CudaArena()
+        self.embeddings = None
+        self.acoustic_control = None
+        self.temp = None
+        self.dep = None
+        self.mimi = None
+        self.closed = False
+        self._active = False
+        self.request_count = 0
+        try:
+            self.phone = PhoneEncoder(files.phone_engine, self.cuda_stream, self.arena)
+            self.temp = TempDecoder(files.temp_engine, self.bundle, self.cuda_stream, self.arena)
+            self.dep = DepDecoder(files.dep_engine, self.cuda_stream, self.arena)
+            self.mimi = MimiDecoder(
+                files.mimi_engine,
+                files.mimi_state,
+                self.cuda_stream,
+                self.arena,
             )
-        if args.cuda_temp_graph:
-            temp.capture_graph()
-        if args.cuda_dep_graph:
-            if acoustic_control is None:
-                raise ValueError(
-                    "--cuda-dep-graph requires --cuda-acoustic-control-cubin"
+            self.embeddings = AudioEmbeddings(
+                files.audio_embedding_weight,
+                files.audio_embedding_cubin,
+                self.cuda_stream,
+                self.arena,
+            )
+            if files.cuda_acoustic_control_cubin is not None:
+                self.acoustic_control = CudaAcousticControl(files.cuda_acoustic_control_cubin)
+            if cuda_temp_graph:
+                self.temp.capture_graph()
+            if cuda_dep_graph:
+                if self.acoustic_control is None:
+                    raise ValueError("cuda_dep_graph requires cuda_acoustic_control_cubin")
+                self.dep.capture_acoustic_graph(
+                    float(self.config["cfg_ac_gamma"]),
+                    self.acoustic_control,
+                    self.embeddings.core.weight_pointer,
                 )
-            dep.capture_acoustic_graph(
-                float(config["cfg_ac_gamma"]),
-                acoustic_control,
-                embeddings.core.weight_pointer,
+        except BaseException:
+            self._close_resources()
+            raise
+
+        self.projected_speaker = bfloat16_to_float32(self.bundle.array("speaker.projected"))
+        self.prompt_indices = np.asarray(self.bundle.array("prompt.phone_indices")).copy()
+        self.prompt_frames = int(self.bundle.manifest["prompt_frames"])
+        cached_output = self.bundle.array("prefill.output")
+        if self.bundle.specs["prefill.output"]["dtype"] == "bfloat16":
+            self.initial_hidden_words = np.asarray(cached_output[:, -1]).copy()
+        else:
+            self.initial_hidden_words = float32_to_bfloat16(cached_output[:, -1])
+        self.initial_semantic_logits = (
+            np.asarray(self.bundle.array("prefill.semantic_logits"))
+            .reshape(2, -1)[..., :12300]
+            .copy()
+        )
+        self.startup_seconds = time.perf_counter() - started
+
+    def __enter__(self) -> "SynthesisRuntime":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
+    @property
+    def sample_rate(self) -> int:
+        return int(self.config["sample_rate"])
+
+    @property
+    def samples_per_chunk(self) -> int:
+        return int(self.config["samples_per_frame"])
+
+    def _release_request(self) -> None:
+        self._active = False
+
+    def _close_resources(self) -> None:
+        if self.temp is not None:
+            self.temp.close()
+            self.temp = None
+        if self.dep is not None:
+            self.dep.close()
+            self.dep = None
+        if self.acoustic_control is not None:
+            self.acoustic_control.close()
+            self.acoustic_control = None
+        if self.embeddings is not None:
+            self.embeddings.close()
+            self.embeddings = None
+        if hasattr(self, "arena"):
+            self.arena.close()
+        if hasattr(self, "stream_handle"):
+            cuda_check(
+                cudart.cudaStreamDestroy(self.stream_handle),
+                "cudaStreamDestroy",
             )
 
-        if frontend_result is None:
-            phone_tokens = bundle.array("phone.tokens")
-            punctuation = bundle.array("phone.punctuation_indices")
-            phone_sequence_length = int(bundle.manifest["phone_seq_len"])
-        else:
-            phone_tokens = frontend_result.phone_tokens
-            punctuation = frontend_result.punctuation_indices
-            phone_sequence_length = frontend_result.phone_seq_len
-        phone_embeddings = stable_remove_rows(phone.run(phone_tokens), punctuation)
-        projected_speaker = bfloat16_to_float32(bundle.array("speaker.projected"))
-        prompt_indices = bundle.array("prompt.phone_indices")
-        state = FrameState(prompt_indices, args.max_frames)
-        prompt_frames = int(bundle.manifest["prompt_frames"])
-        position = prompt_frames - 1
-        cached_output = bundle.array("prefill.output")
-        if bundle.specs["prefill.output"]["dtype"] == "bfloat16":
-            last_hidden_words = cached_output[:, -1]
-        else:
-            last_hidden_words = float32_to_bfloat16(cached_output[:, -1])
-        semantic_logits = bundle.array("prefill.semantic_logits")
-        semantic_logits = semantic_logits.reshape(2, -1)[..., :12300]
-        rng = np.random.default_rng(args.seed)
-        generation_limit = args.max_frames
-        if args.teacher_force_reference:
-            if not bundle.manifest.get("reference_matches_text", False):
-                raise ValueError("asset bundle has no reference for this text")
-            reference_codes = bundle.array("reference.mimi_codes")[:, :, prompt_frames:]
-            reference_shifts = bundle.array("reference.pred_shifts")
-            generation_limit = min(generation_limit, reference_codes.shape[2])
-        else:
-            reference_codes = None
-            reference_shifts = None
-        previous_semantic = None
-        frame = None
-        generation_started = time.perf_counter()
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        with wave.open(str(args.output), "wb") as sink:
-            sink.setnchannels(1)
-            sink.setsampwidth(2)
-            sink.setframerate(int(config["sample_rate"]))
+    def close(self) -> None:
+        if self.closed:
+            return
+        if self._active:
+            raise RuntimeError("cannot close runtime while a PCM stream is active")
+        self._close_resources()
+        self.frontend = None
+        self.closed = True
+
+    def synthesize_stream(
+        self,
+        text: str | None,
+        *,
+        seed: int = 20260830,
+        max_frames: int = 256,
+        allow_unknown_phones: bool = False,
+        teacher_force_reference: bool = False,
+        include_trajectory: bool = True,
+    ) -> SynthesisStream:
+        if self.closed:
+            raise RuntimeError("synthesis runtime is closed")
+        if self._active:
+            raise RuntimeError("synthesis runtime already has an active stream")
+        if text is not None and teacher_force_reference:
+            raise ValueError("teacher forcing cannot be used with dynamic text")
+        if text is not None and self.frontend is None:
+            raise ValueError("dynamic text requires resident RUAccent assets and a phone map")
+        self._active = True
+        request_index = self.request_count
+        self.request_count += 1
+        iterator = self._generate(
+            text=text,
+            seed=seed,
+            max_frames=max_frames,
+            allow_unknown_phones=allow_unknown_phones,
+            teacher_force_reference=teacher_force_reference,
+            include_trajectory=include_trajectory,
+            request_index=request_index,
+        )
+        return SynthesisStream(iterator, self._release_request)
+
+    def _generate(
+        self,
+        *,
+        text: str | None,
+        seed: int,
+        max_frames: int,
+        allow_unknown_phones: bool,
+        teacher_force_reference: bool,
+        include_trajectory: bool,
+        request_index: int,
+    ) -> Generator[bytes, None, dict[str, object]]:
+        request_started = time.perf_counter()
+        frontend_metrics = None
+        frontend_result = None
+        try:
+            if text is not None:
+                frontend_started = time.perf_counter()
+                prompt_len = int(self.bundle.manifest["prompt_phone_len"])
+                prompt_prefix = self.bundle.array("phone.tokens")[0, :prompt_len]
+                frontend_result = self.frontend.prepare(text, prompt_prefix)
+                frontend_finished = time.perf_counter()
+                if frontend_result.unknown_phones and not allow_unknown_phones:
+                    raise ValueError(
+                        "frontend produced phones outside the model vocabulary: "
+                        f"{frontend_result.unknown_phones}"
+                    )
+                frontend_metrics = {
+                    "backend": (f"{self.frontend.text_normalizer_backend}+ruaccent-onnx+espeak-ng"),
+                    "normalized_text": frontend_result.normalized_text,
+                    "accented_text": frontend_result.accented_text,
+                    "phonemes": frontend_result.phonemes,
+                    "unknown_phones": list(frontend_result.unknown_phones),
+                    "phone_tokens_shape": list(frontend_result.phone_tokens.shape),
+                    "phone_seq_len": frontend_result.phone_seq_len,
+                    "resident_load_seconds": round(self.frontend_load_seconds, 3),
+                    "process_seconds": round(frontend_finished - frontend_started, 3),
+                    "reused": request_index > 0,
+                    "peak_rss_mib": round(
+                        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+                        1,
+                    ),
+                }
+
+            self.temp.reset()
+            self.dep.reset()
+            self.mimi.reset()
+            call_start = {
+                "temp": self.temp.calls,
+                "temp_cuda_graph": self.temp.graph_launches,
+                "dep_q2": self.dep.calls[2],
+                "dep_q1": self.dep.calls[1],
+                "mimi": self.mimi.calls,
+                "audio_embedding": self.embeddings.core.calls,
+                "cuda_acoustic_control": (
+                    self.acoustic_control.calls if self.acoustic_control is not None else 0
+                ),
+                "dep_cuda_graph": self.dep.graph_launches,
+            }
+
+            if frontend_result is None:
+                phone_tokens = self.bundle.array("phone.tokens")
+                punctuation = self.bundle.array("phone.punctuation_indices")
+                phone_sequence_length = int(self.bundle.manifest["phone_seq_len"])
+                result_text = str(self.bundle.manifest["text"])
+            else:
+                phone_tokens = frontend_result.phone_tokens
+                punctuation = frontend_result.punctuation_indices
+                phone_sequence_length = frontend_result.phone_seq_len
+                result_text = text
+            phone_embeddings = stable_remove_rows(self.phone.run(phone_tokens), punctuation)
+
+            state = FrameState(self.prompt_indices, max_frames)
+            position = self.prompt_frames - 1
+            last_hidden_words = self.initial_hidden_words.copy()
+            semantic_logits = self.initial_semantic_logits.copy()
+            rng = np.random.default_rng(seed)
+            generation_limit = max_frames
+            if teacher_force_reference:
+                if not self.bundle.manifest.get("reference_matches_text", False):
+                    raise ValueError("asset bundle has no reference for this text")
+                reference_codes = self.bundle.array("reference.mimi_codes")[
+                    :, :, self.prompt_frames :
+                ]
+                reference_shifts = self.bundle.array("reference.pred_shifts")
+                generation_limit = min(generation_limit, reference_codes.shape[2])
+            else:
+                reference_codes = None
+                reference_shifts = None
+
+            trajectory: list[dict[str, object]] = []
+            teacher_forced_comparisons: list[dict[str, object]] = []
+            frame_times: list[float] = []
+            stage_seconds = {
+                "temp_input": 0.0,
+                "temp_engine": 0.0,
+                "semantic_and_q2_input": 0.0,
+                "dep_frame": 0.0,
+                "mimi": 0.0,
+            }
+            audio_frames = 0
+            first_audio_seconds = None
+            first_audio_request_seconds = None
+            previous_semantic = None
+            frame = None
+            generation_started = time.perf_counter()
+
             for frame_index in range(generation_limit):
                 frame_started = time.perf_counter()
                 if frame_index:
@@ -1028,69 +1254,69 @@ def main() -> None:
                         selected = phone_embeddings[batch, state.indices[batch, 0]]
                         phone_chunk[batch] = bfloat16_to_float32(selected).sum(axis=0)
                     audio_tokens = np.repeat(
-                        np.asarray(frame, dtype=np.int64).reshape(1, 16), 2, axis=0
+                        np.asarray(frame, dtype=np.int64).reshape(1, 16),
+                        2,
+                        axis=0,
                     )
-                    audio_words = embeddings.gather(
-                        audio_tokens, np.arange(16, dtype=np.int64)[None]
+                    audio_words = self.embeddings.gather(
+                        audio_tokens,
+                        np.arange(16, dtype=np.int64)[None],
                     )
                     hidden = phone_chunk + bfloat16_to_float32(audio_words).sum(axis=1)
                     hidden_words = float32_to_bfloat16(hidden).reshape(2, 1, 1024)
                     stage_seconds["temp_input"] += time.perf_counter() - stage_started
                     stage_started = time.perf_counter()
-                    temp_output, semantic_logits = temp.step(hidden_words, position)
+                    temp_output, semantic_logits = self.temp.step(hidden_words, position)
                     last_hidden_words = float32_to_bfloat16(temp_output[:, -1])
                     stage_seconds["temp_engine"] += time.perf_counter() - stage_started
 
                 stage_started = time.perf_counter()
-                semantic, predicted_shift = sample_semantic(
-                    semantic_logits, config, rng
-                )
+                semantic, predicted_shift = sample_semantic(semantic_logits, self.config, rng)
                 reference_frame = None
-                if args.teacher_force_reference:
+                if teacher_force_reference:
                     reference_frame = reference_codes[0, :, frame_index]
                     semantic = int(reference_frame[0])
                     predicted_shift = int(reference_shifts[frame_index])
                 speaker_hidden = bfloat16_to_float32(last_hidden_words) + (
-                    projected_speaker * float(config["spk_proj_weight"])
+                    self.projected_speaker * float(self.config["spk_proj_weight"])
                 )
                 speaker_hidden_words = float32_to_bfloat16(speaker_hidden)
-                code_word = embeddings.gather(
+                code_word = self.embeddings.gather(
                     np.asarray([[semantic]], dtype=np.int64),
                     np.asarray([[0]], dtype=np.int64),
                 )[0, 0]
                 code_words = np.repeat(code_word[None], 2, axis=0)
                 dep_hidden = np.stack([speaker_hidden_words, code_words], axis=1)
-                stage_seconds["semantic_and_q2_input"] += (
-                    time.perf_counter() - stage_started
-                )
+                stage_seconds["semantic_and_q2_input"] += time.perf_counter() - stage_started
+
                 stage_started = time.perf_counter()
-                if acoustic_control is not None:
-                    frame = dep.generate_acoustic_cuda(
+                if self.acoustic_control is not None:
+                    frame = self.dep.generate_acoustic_cuda(
                         dep_hidden,
                         semantic,
-                        float(config["cfg_ac_gamma"]),
-                        acoustic_control,
-                        embeddings.core.weight_pointer,
+                        float(self.config["cfg_ac_gamma"]),
+                        self.acoustic_control,
+                        self.embeddings.core.weight_pointer,
                     )
                 else:
-                    dep.reset()
+                    self.dep.reset()
                     frame = [semantic]
-                    acoustic_logits = dep.step(dep_hidden, np.asarray([0, 1]))
+                    acoustic_logits = self.dep.step(dep_hidden, np.asarray([0, 1]))
                     for codebook in range(1, 16):
                         token = acoustic_argmax(
-                            acoustic_logits, float(config["cfg_ac_gamma"])
+                            acoustic_logits,
+                            float(self.config["cfg_ac_gamma"]),
                         )
                         frame.append(token)
                         if codebook < 15:
-                            word = embeddings.gather(
+                            word = self.embeddings.gather(
                                 np.asarray([[token]], dtype=np.int64),
                                 np.asarray([[codebook]], dtype=np.int64),
                             )[0, 0]
-                            hidden_words = np.repeat(
-                                word.reshape(1, 1, 1024), 2, axis=0
-                            )
-                            acoustic_logits = dep.step(
-                                hidden_words, np.asarray([codebook + 1])
+                            hidden_words = np.repeat(word.reshape(1, 1, 1024), 2, axis=0)
+                            acoustic_logits = self.dep.step(
+                                hidden_words,
+                                np.asarray([codebook + 1]),
                             )
                 stage_seconds["dep_frame"] += time.perf_counter() - stage_started
                 generated_frame = np.asarray(frame, dtype=np.int64)
@@ -1099,35 +1325,34 @@ def main() -> None:
                         {
                             "index": frame_index,
                             "acoustic_tokens_equal": bool(
-                                np.array_equal(generated_frame[1:], reference_frame[1:])
+                                np.array_equal(
+                                    generated_frame[1:],
+                                    reference_frame[1:],
+                                )
                             ),
                             "different_acoustic_tokens": int(
                                 np.count_nonzero(generated_frame[1:] != reference_frame[1:])
                             ),
                         }
                     )
-                    # The next temp step must see the accepted input trajectory;
-                    # otherwise one mismatch would contaminate every later check.
                     frame = np.asarray(reference_frame, dtype=np.int64)
                 else:
                     frame = generated_frame
 
-                if frame_index >= int(config["audio_delay_frames"]):
+                pcm_bytes = None
+                if frame_index >= int(self.config["audio_delay_frames"]):
                     stage_started = time.perf_counter()
-                    mimi_codes = np.concatenate(
-                        [np.asarray([previous_semantic]), frame[1:]]
-                    )
-                    audio = mimi.decode(mimi_codes)
+                    mimi_codes = np.concatenate([np.asarray([previous_semantic]), frame[1:]])
+                    audio = self.mimi.decode(mimi_codes)
                     pcm = np.clip(audio, -1.0, 1.0)
                     pcm = np.rint(pcm * 32767.0).astype("<i2")
-                    sink.writeframesraw(pcm.tobytes())
+                    pcm_bytes = pcm.tobytes()
                     audio_frames += 1
                     if first_audio_seconds is None:
-                        first_audio_seconds = time.perf_counter() - generation_started
-                        first_audio_wall_seconds = time.perf_counter() - started
+                        now = time.perf_counter()
+                        first_audio_seconds = now - generation_started
+                        first_audio_request_seconds = now - request_started
                     stage_seconds["mimi"] += time.perf_counter() - stage_started
-                else:
-                    previous_semantic = semantic
                 previous_semantic = semantic
 
                 eos_reached = state.eos_index <= frame_index
@@ -1137,91 +1362,162 @@ def main() -> None:
                         predicted_shift,
                         frame_index,
                         phone_sequence_length,
-                        config,
+                        self.config,
                     )
                 frame_times.append(time.perf_counter() - frame_started)
-                trajectory.append(
-                    {
-                        "index": frame_index,
-                        "position": position,
-                        "semantic": semantic,
-                        "predicted_shift": predicted_shift,
-                        "phone_max": state.maximum,
-                        "eos_index": state.eos_index,
-                        "codes": generated_frame.tolist(),
-                    }
-                )
+                if include_trajectory:
+                    trajectory.append(
+                        {
+                            "index": frame_index,
+                            "position": position,
+                            "semantic": semantic,
+                            "predicted_shift": predicted_shift,
+                            "phone_max": state.maximum,
+                            "eos_index": state.eos_index,
+                            "codes": generated_frame.tolist(),
+                        }
+                    )
+                if pcm_bytes is not None:
+                    yield pcm_bytes
                 if eos_reached:
                     break
-        generation_seconds = time.perf_counter() - generation_started
-    finally:
-        if temp is not None:
-            temp.close()
-        if dep is not None:
-            dep.close()
-        if acoustic_control is not None:
-            acoustic_control.close()
-        if embeddings is not None:
-            embeddings.close()
-        arena.close()
-        cuda_check(cudart.cudaStreamDestroy(stream_handle), "cudaStreamDestroy")
 
-    if "torch" in sys.modules:
-        raise RuntimeError("PyTorch entered sys.modules during torchless execution")
-    audio_seconds = audio_frames * int(config["samples_per_frame"]) / int(
-        config["sample_rate"]
-    )
-    result = {
-        "runtime": "numpy+tensorrt+cuda-python",
-        "torch_imported": False,
-        "text": args.text if args.text is not None else bundle.manifest["text"],
-        "output": str(args.output),
-        "output_bytes": args.output.stat().st_size,
-        "output_sha256": file_sha256(args.output),
-        "frames": len(trajectory),
-        "audio_frames": audio_frames,
-        "audio_seconds": round(audio_seconds, 3),
-        "generation_seconds": round(generation_seconds, 3),
-        "rtf": round(generation_seconds / audio_seconds, 3),
-        "ttfa_seconds": round(float(first_audio_seconds), 3),
-        "cold_start_to_first_audio_seconds": round(
-            float(first_audio_wall_seconds), 3
-        ),
-        "frontend": frontend_metrics,
-        "frame_ms": {
-            "mean": round(float(np.mean(frame_times)) * 1000, 3),
-            "p95": round(float(np.percentile(frame_times, 95)) * 1000, 3),
-            "max": round(float(np.max(frame_times)) * 1000, 3),
-        },
-        "stage_ms_per_generated_frame": {
-            name: round(seconds * 1000 / len(trajectory), 3)
-            for name, seconds in stage_seconds.items()
-        },
-        "calls": {
-            "temp": temp.calls,
-            "temp_cuda_graph": temp.graph_launches,
-            "dep_q2": dep.calls[2],
-            "dep_q1": dep.calls[1],
-            "mimi": mimi.calls,
-            "audio_embedding": embeddings.core.calls,
-            "cuda_acoustic_control": (
-                acoustic_control.calls if acoustic_control is not None else 0
-            ),
-            "dep_cuda_graph": dep.graph_launches,
-        },
-        "teacher_forced": {
-            "enabled": args.teacher_force_reference,
-            "frames": len(teacher_forced_comparisons),
-            "all_acoustic_tokens_equal": bool(teacher_forced_comparisons)
-            and all(item["acoustic_tokens_equal"] for item in teacher_forced_comparisons),
-            "comparisons": teacher_forced_comparisons,
-        },
-        "trajectory": trajectory,
-        "startup_plus_generation_seconds": round(time.perf_counter() - started, 3),
-        "max_rss_mib": round(
-            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024, 1
-        ),
-    }
+            if first_audio_seconds is None or first_audio_request_seconds is None:
+                raise RuntimeError("generation ended before the first PCM chunk")
+            generation_compute_seconds = sum(frame_times)
+            audio_seconds = audio_frames * self.samples_per_chunk / self.sample_rate
+            calls = {
+                "temp": self.temp.calls - call_start["temp"],
+                "temp_cuda_graph": (self.temp.graph_launches - call_start["temp_cuda_graph"]),
+                "dep_q2": self.dep.calls[2] - call_start["dep_q2"],
+                "dep_q1": self.dep.calls[1] - call_start["dep_q1"],
+                "mimi": self.mimi.calls - call_start["mimi"],
+                "audio_embedding": (self.embeddings.core.calls - call_start["audio_embedding"]),
+                "cuda_acoustic_control": (
+                    (self.acoustic_control.calls if self.acoustic_control is not None else 0)
+                    - call_start["cuda_acoustic_control"]
+                ),
+                "dep_cuda_graph": (self.dep.graph_launches - call_start["dep_cuda_graph"]),
+            }
+            request_seconds = time.perf_counter() - request_started
+            result = {
+                "runtime": "numpy+tensorrt+cuda-python",
+                "torch_imported": False,
+                "resident": True,
+                "request_index": request_index,
+                "text": result_text,
+                "frames": len(frame_times),
+                "audio_frames": audio_frames,
+                "audio_seconds": round(audio_seconds, 3),
+                "generation_seconds": round(generation_compute_seconds, 3),
+                "stream_wall_seconds": round(time.perf_counter() - generation_started, 3),
+                "request_seconds": round(request_seconds, 3),
+                "rtf": round(generation_compute_seconds / audio_seconds, 3),
+                "ttfa_seconds": round(float(first_audio_seconds), 3),
+                "request_to_first_audio_seconds": round(float(first_audio_request_seconds), 3),
+                "cold_start_to_first_audio_seconds": (
+                    round(
+                        self.startup_seconds + float(first_audio_request_seconds),
+                        3,
+                    )
+                    if request_index == 0
+                    else None
+                ),
+                "runtime_startup_seconds": round(self.startup_seconds, 3),
+                "frontend": frontend_metrics,
+                "pcm": {
+                    "format": "s16le",
+                    "sample_rate": self.sample_rate,
+                    "channels": 1,
+                    "samples_per_chunk": self.samples_per_chunk,
+                    "bytes_per_chunk": self.samples_per_chunk * 2,
+                },
+                "frame_ms": {
+                    "mean": round(float(np.mean(frame_times)) * 1000, 3),
+                    "p95": round(float(np.percentile(frame_times, 95)) * 1000, 3),
+                    "max": round(float(np.max(frame_times)) * 1000, 3),
+                },
+                "stage_ms_per_generated_frame": {
+                    name: round(seconds * 1000 / len(frame_times), 3)
+                    for name, seconds in stage_seconds.items()
+                },
+                "calls": calls,
+                "teacher_forced": {
+                    "enabled": teacher_force_reference,
+                    "frames": len(teacher_forced_comparisons),
+                    "all_acoustic_tokens_equal": bool(teacher_forced_comparisons)
+                    and all(item["acoustic_tokens_equal"] for item in teacher_forced_comparisons),
+                    "comparisons": teacher_forced_comparisons,
+                },
+                "trajectory": trajectory,
+                "max_rss_mib": round(
+                    resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+                    1,
+                ),
+            }
+            if "torch" in sys.modules:
+                raise RuntimeError("PyTorch entered sys.modules during torchless execution")
+            return result
+        finally:
+            self._release_request()
+
+    def synthesize_to_wav(
+        self,
+        text: str | None,
+        output: Path,
+        **stream_options,
+    ) -> dict[str, object]:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        stream = self.synthesize_stream(text, **stream_options)
+        try:
+            with wave.open(str(output), "wb") as sink:
+                sink.setnchannels(1)
+                sink.setsampwidth(2)
+                sink.setframerate(self.sample_rate)
+                for pcm_chunk in stream:
+                    sink.writeframesraw(pcm_chunk)
+        finally:
+            if not stream.closed:
+                stream.close()
+        if stream.result is None:
+            raise RuntimeError("PCM stream completed without synthesis metrics")
+        result = dict(stream.result)
+        result.update(
+            {
+                "output": str(output),
+                "output_bytes": output.stat().st_size,
+                "output_sha256": file_sha256(output),
+            }
+        )
+        return result
+
+
+def main() -> None:
+    args = parse_args()
+    metrics_path = args.metrics or args.output.with_suffix(".json")
+    if metrics_path.resolve() == args.assets.resolve():
+        raise ValueError(
+            "metrics path would overwrite the immutable asset manifest; "
+            "pass --metrics with a distinct path"
+        )
+    with SynthesisRuntime(
+        RuntimeFiles.from_args(args),
+        ruaccent_assets=args.ruaccent_assets,
+        phone_map=args.phone_map,
+        espeak_executable=args.espeak_executable,
+        text_normalizer=args.text_normalizer,
+        cuda_temp_graph=args.cuda_temp_graph,
+        cuda_dep_graph=args.cuda_dep_graph,
+    ) as runtime:
+        result = runtime.synthesize_to_wav(
+            args.text,
+            args.output,
+            seed=args.seed,
+            max_frames=args.max_frames,
+            allow_unknown_phones=args.allow_unknown_phones,
+            teacher_force_reference=args.teacher_force_reference,
+        )
     metrics_path.write_text(json.dumps(result, ensure_ascii=False, indent=2))
     print(json.dumps(result, ensure_ascii=False, indent=2))
 

@@ -21,6 +21,7 @@ dev = ["ruff==0.15.17"]
 
 [project.scripts]
 voxtream2-ru-jetson = "voxtream2_ru_jetson.runtime:main"
+voxtream2-ru-jetson-resident = "voxtream2_ru_jetson.resident:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
