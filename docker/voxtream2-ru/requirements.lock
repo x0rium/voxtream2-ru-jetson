@@ -1,4 +1,4 @@
-# Complete Python environment verified on JetPack 6.2.1 / L4T R36.4.
+# Complete Python environment verified on JetPack 6.2.3 / L4T R36.5.2.
 # Regenerate deliberately after testing a new dependency set; do not use
 # `pip freeze` from the PyTorch-capable export environment.
 certifi==2026.7.22

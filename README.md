@@ -10,7 +10,7 @@ BF16 через TensorRT и CUDA.
 TensorRT engines и сгенерированный звук здесь не хранятся.
 
 Переносимые ONNX и их manifest публикуются отдельно в
-[`x0rium/voxtream2-ru-jetson-onnx`](https://huggingface.co/x0rium/voxtream2-ru-jetson-onnx).
+[`x0rium/voxtream2-ru-jetson-onnx@v0.2.1`](https://huggingface.co/x0rium/voxtream2-ru-jetson-onnx/tree/v0.2.1).
 
 Это исследовательский прототип, а не готовый TTS-сервис. TensorRT plans нужно
 собирать на целевом Jetson: готовый engine с RTX/x86 нельзя перенести на
@@ -88,8 +88,9 @@ R36.5.2:
   физической USB-колонкой ещё не реализованы.
 - Sink-attention rebuild после позиции 624 реализован по upstream-политике
   prompt + recent tail. Для текущего prompt длиной 108 кадров q=420 profile
-  восстанавливает prompt и последние 312 temporal-входов. Старый static plan
-  остаётся точным, но медленным q=1 fallback.
+  восстанавливает prompt и последние 312 temporal-входов. Если в едином plan
+  нет точного профиля q=420, runtime останавливается при запуске и не выдаёт
+  частично корректный длинный звук.
 
 ## Структура
 
@@ -100,6 +101,8 @@ R36.5.2:
 - `docker/voxtream2-ru/` — воспроизводимое Jetson-окружение;
 - `docs/architecture.md` — границы текущего результата;
 - `docs/development.md` — цикл экспорта, сборки и проверки.
+- `docs/jetson-install.md` — установка опубликованного релиза с чистого
+  checkout;
 - `docs/resident-runtime.md` — PCM API и протокол резидентного процесса.
 
 ## Быстрая проверка
@@ -118,8 +121,8 @@ ruff check src tools experiments tests
 PYTHONPATH=src python3 -m voxtream2_ru_jetson --help
 ```
 
-Пример запуска после подготовки engines и assets находится в
-[`docs/development.md`](docs/development.md).
+Полная установка, сборка всех четырёх engines и первый запуск находятся в
+[`docs/jetson-install.md`](docs/jetson-install.md).
 
 ## Лицензии
 

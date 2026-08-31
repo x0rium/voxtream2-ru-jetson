@@ -8,6 +8,8 @@ PyTorch-less runtime:
 - `export_voxtream_audio_embeddings.py` — таблица audio embeddings в raw BF16;
 - `patch_onnx_*.py` — добавление проекционных heads и исправление выходов ONNX;
 - `build_tensorrt_engine.py` — сборка TensorRT plan с метриками;
+- `download_ruaccent_assets.py` — зафиксированный набор RUAccent для frontend;
+- `verify_release.py` — проверка размеров и SHA-256 файлов Hugging Face;
 - `inspect_*.py` и `compare_voxtream_captures.py` — диагностика планов и
   сравнение захватов.
 
