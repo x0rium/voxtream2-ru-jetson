@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import struct
 import sys
 from collections.abc import Iterator
@@ -12,12 +13,22 @@ from pathlib import Path
 from typing import BinaryIO, TextIO
 
 HEADER = struct.Struct("<cI")
+MAX_RECORD_BYTES = 16 * 1024 * 1024
 READY = b"R"
 START = b"S"
 PCM = b"P"
 DONE = b"D"
 ERROR = b"E"
 JSON_RECORDS = frozenset((READY, START, DONE, ERROR))
+
+
+def detach_protocol_stdout() -> BinaryIO:
+    """Reserve the original stdout for framed records and send logs to stderr."""
+    sys.stdout.flush()
+    protocol_fd = os.dup(sys.stdout.fileno())
+    os.set_inheritable(protocol_fd, False)
+    os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    return os.fdopen(protocol_fd, "wb", buffering=0)
 
 
 def write_record(sink: BinaryIO, kind: bytes, payload: bytes) -> None:
@@ -58,6 +69,11 @@ def iter_records(source: BinaryIO) -> Iterator[tuple[bytes, bytes]]:
         if len(header) != HEADER.size:
             raise EOFError("truncated resident record header")
         kind, size = HEADER.unpack(header)
+        if size > MAX_RECORD_BYTES:
+            raise ValueError(
+                f"resident record payload is too large: {size} > {MAX_RECORD_BYTES}; "
+                "stdout likely contains non-protocol text"
+            )
         payload = _read_exact(source, size)
         if len(payload) != size:
             raise EOFError("truncated resident record payload")
@@ -162,7 +178,6 @@ def parse_args() -> argparse.Namespace:
         default="ru-normalizr",
     )
     parser.add_argument("--temp-engine", type=Path, required=True)
-    parser.add_argument("--temp-prefill-engine", type=Path)
     parser.add_argument("--dep-engine", type=Path, required=True)
     parser.add_argument("--phone-engine", type=Path, required=True)
     parser.add_argument("--mimi-engine", type=Path, required=True)
@@ -176,31 +191,36 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    from .runtime import RuntimeFiles, SynthesisRuntime
-
     args = parse_args()
-    files = RuntimeFiles(
-        assets=args.assets,
-        temp_engine=args.temp_engine,
-        temp_prefill_engine=args.temp_prefill_engine,
-        dep_engine=args.dep_engine,
-        phone_engine=args.phone_engine,
-        mimi_engine=args.mimi_engine,
-        mimi_state=args.mimi_state,
-        audio_embedding_weight=args.audio_embedding_weight,
-        audio_embedding_cubin=args.audio_embedding_cubin,
-        cuda_acoustic_control_cubin=args.cuda_acoustic_control_cubin,
-    )
-    with SynthesisRuntime(
-        files,
-        ruaccent_assets=args.ruaccent_assets,
-        phone_map=args.phone_map,
-        espeak_executable=args.espeak_executable,
-        text_normalizer=args.text_normalizer,
-        cuda_temp_graph=args.cuda_temp_graph,
-        cuda_dep_graph=args.cuda_dep_graph,
-    ) as runtime:
-        serve_jsonl(runtime, sys.stdin, sys.stdout.buffer)
+    # TensorRT and CUDA write native diagnostics to file descriptor 1.  Keep
+    # those bytes out of the framed protocol even during runtime startup.
+    protocol_sink = detach_protocol_stdout()
+    try:
+        from .runtime import RuntimeFiles, SynthesisRuntime
+
+        files = RuntimeFiles(
+            assets=args.assets,
+            temp_engine=args.temp_engine,
+            dep_engine=args.dep_engine,
+            phone_engine=args.phone_engine,
+            mimi_engine=args.mimi_engine,
+            mimi_state=args.mimi_state,
+            audio_embedding_weight=args.audio_embedding_weight,
+            audio_embedding_cubin=args.audio_embedding_cubin,
+            cuda_acoustic_control_cubin=args.cuda_acoustic_control_cubin,
+        )
+        with SynthesisRuntime(
+            files,
+            ruaccent_assets=args.ruaccent_assets,
+            phone_map=args.phone_map,
+            espeak_executable=args.espeak_executable,
+            text_normalizer=args.text_normalizer,
+            cuda_temp_graph=args.cuda_temp_graph,
+            cuda_dep_graph=args.cuda_dep_graph,
+        ) as runtime:
+            serve_jsonl(runtime, sys.stdin, protocol_sink)
+    finally:
+        protocol_sink.close()
 
 
 if __name__ == "__main__":

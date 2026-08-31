@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voxtream2-ru-jetson"
-version = "0.1.0"
+version = "0.2.0"
 description = "PyTorch-free TensorRT runtime for VoXtream2-RU on NVIDIA Jetson"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,11 +17,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["ruff==0.15.17"]
+dev = ["pytest>=8,<10", "ruff==0.15.17"]
 
 [project.scripts]
 voxtream2-ru-jetson = "voxtream2_ru_jetson.runtime:main"
 voxtream2-ru-jetson-resident = "voxtream2_ru_jetson.resident:main"
+voxtream2-ru-jetson-playback = "voxtream2_ru_jetson.playback:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -37,3 +38,6 @@ target-version = "py310"
 # Stable baseline for both the reusable runtime and archived research probes.
 select = ["E4", "E7", "E9", "F", "I"]
 ignore = ["E501", "EXE001"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]

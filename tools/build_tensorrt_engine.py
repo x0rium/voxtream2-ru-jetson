@@ -25,11 +25,11 @@ def parse_args() -> argparse.Namespace:
         "--sequence-profiles",
         type=int,
         nargs="+",
-        choices=(1, 2),
         help=(
             "Add fixed-shape optimization profiles for a dynamic sequence axis. "
             "Values may repeat when separate live execution contexts need the "
-            "same q shape, for example: 1 1 2."
+            "same q shape, for example: 1 1 2, or select distinct hot and "
+            "replay shapes, for example: 1 420."
         ),
     )
     parser.add_argument(
@@ -46,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.sequence_profiles and args.sequence_range:
         parser.error("--sequence-profiles and --sequence-range are mutually exclusive")
+    if args.sequence_profiles and any(value < 1 for value in args.sequence_profiles):
+        parser.error("--sequence-profiles values must be positive")
     if args.sequence_range:
         minimum, optimum, maximum = args.sequence_range
         if not 1 <= minimum <= optimum <= maximum:

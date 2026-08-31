@@ -1,0 +1,8 @@
+# Offline ONNX export only. The Jetson runtime must not install these packages.
+torch==2.7.0
+torchao==0.10.0
+torchtune==0.4.0
+safetensors==0.8.0
+onnx==1.17.0
+onnxscript==0.3.2
+onnx-ir==0.1.9

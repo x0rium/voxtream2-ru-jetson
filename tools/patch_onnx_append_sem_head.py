@@ -58,11 +58,18 @@ def main() -> None:
             ),
         ]
     )
-    model.graph.output.append(
-        helper.make_tensor_value_info(
-            "semantic_logits", TensorProto.BFLOAT16, [2, 1, 12300]
-        )
-    )
+    temp_output = next(value for value in model.graph.output if value.name == "output")
+    temp_shape = temp_output.type.tensor_type.shape
+    if len(temp_shape.dim) != 3:
+        raise RuntimeError(f"unexpected temp output rank: {len(temp_shape.dim)}")
+    semantic_output = onnx.ValueInfoProto()
+    semantic_output.name = "semantic_logits"
+    semantic_output.type.tensor_type.elem_type = TensorProto.BFLOAT16
+    semantic_shape = semantic_output.type.tensor_type.shape
+    semantic_shape.dim.add().CopyFrom(temp_shape.dim[0])
+    semantic_shape.dim.add().CopyFrom(temp_shape.dim[1])
+    semantic_shape.dim.add().dim_value = 12300
+    model.graph.output.append(semantic_output)
     onnx.checker.check_model(model)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     onnx.save(model, args.output)

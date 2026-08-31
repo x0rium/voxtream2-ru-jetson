@@ -106,6 +106,10 @@ class ResidentProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(EOFError, "truncated resident record header"):
             list(iter_records(io.BytesIO(b"P\x05")))
 
+    def test_non_protocol_stdout_is_rejected_without_unbounded_read(self):
+        with self.assertRaisesRegex(ValueError, "non-protocol text"):
+            list(iter_records(io.BytesIO(b"hello from an entrypoint\n")))
+
     def test_fragmented_pipe_reads_are_reassembled(self):
         sink = io.BytesIO()
         serve_jsonl(FakeRuntime(), io.StringIO('{"text":"Тест"}\n'), sink)

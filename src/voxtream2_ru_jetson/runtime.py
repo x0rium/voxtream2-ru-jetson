@@ -53,14 +53,6 @@ def parse_args() -> argparse.Namespace:
         help="Map frontend OOV phones to UNK instead of failing the quality gate.",
     )
     parser.add_argument("--temp-engine", type=Path, required=True)
-    parser.add_argument(
-        "--temp-prefill-engine",
-        type=Path,
-        help=(
-            "Optional fixed-shape temp_former engine for batched sink-attention "
-            "cache rebuilds. Without it, rebuilds use the exact but slow q=1 replay."
-        ),
-    )
     parser.add_argument("--dep-engine", type=Path, required=True)
     parser.add_argument("--phone-engine", type=Path, required=True)
     parser.add_argument("--mimi-engine", type=Path, required=True)
@@ -191,178 +183,6 @@ class EngineOwner:
             raise RuntimeError(f"failed to deserialize {self.path}")
 
 
-def tensorrt_dtype_itemsize(dtype) -> int:
-    item_sizes = {
-        trt.DataType.FLOAT: 4,
-        trt.DataType.HALF: 2,
-        trt.DataType.BF16: 2,
-        trt.DataType.INT64: 8,
-        trt.DataType.INT32: 4,
-        trt.DataType.BOOL: 1,
-        trt.DataType.INT8: 1,
-    }
-    if dtype not in item_sizes:
-        raise TypeError(f"unsupported TensorRT dtype: {dtype}")
-    return item_sizes[dtype]
-
-
-def tensorrt_tensor_nbytes(context, engine, name: str) -> int:
-    shape = tuple(context.get_tensor_shape(name))
-    if any(dimension < 0 for dimension in shape):
-        raise RuntimeError(f"unresolved TensorRT shape {name}={shape}")
-    return int(np.prod(shape, dtype=np.int64)) * tensorrt_dtype_itemsize(
-        engine.get_tensor_dtype(name)
-    )
-
-
-def runtime_state_dtype(value: np.ndarray):
-    if value.dtype == np.uint16:
-        return trt.DataType.BF16
-    if value.dtype == np.int64:
-        return trt.DataType.INT64
-    raise TypeError(f"unsupported temporal state dtype: {value.dtype}")
-
-
-class TempPrefill:
-    """Run one fixed-shape cache rebuild into TempDecoder's existing state."""
-
-    def __init__(
-        self,
-        path: Path,
-        stream: int,
-        arena: CudaArena,
-        state: dict[str, int],
-        state_specs: dict[str, tuple[int, trt.DataType]],
-    ) -> None:
-        self.owner = EngineOwner(path)
-        self.context = self.owner.engine.create_execution_context()
-        self.stream = stream
-        self.arena = arena
-        self.state = state
-        self.shapes = {
-            name: tuple(self.context.get_tensor_shape(name))
-            for name in ("hidden", "input_pos", "mask")
-        }
-        hidden_shape = self.shapes["hidden"]
-        if len(hidden_shape) != 3 or hidden_shape[0] != 2 or hidden_shape[2] != 1024:
-            raise ValueError(f"unexpected temp prefill hidden shape: {hidden_shape}")
-        self.sequence_length = int(hidden_shape[1])
-        expected_shapes = {
-            "input_pos": (2, self.sequence_length),
-            "mask": (2, self.sequence_length, 2048),
-        }
-        for name, expected in expected_shapes.items():
-            if self.shapes[name] != expected:
-                raise ValueError(
-                    f"unexpected temp prefill {name} shape: {self.shapes[name]} != {expected}"
-                )
-
-        required_tensors = {
-            "hidden",
-            "input_pos",
-            "mask",
-            "output",
-            *state,
-            *(f"next_{name}" for name in state),
-        }
-        actual_tensors = {
-            self.owner.engine.get_tensor_name(index)
-            for index in range(self.owner.engine.num_io_tensors)
-        }
-        unexpected_tensors = actual_tensors - required_tensors
-        missing_tensors = required_tensors - actual_tensors
-        if missing_tensors or unexpected_tensors:
-            raise ValueError(
-                "temp prefill engine I/O mismatch: "
-                f"missing={sorted(missing_tensors)}, "
-                f"unexpected={sorted(unexpected_tensors)}"
-            )
-
-        self.inputs = {
-            name: arena.allocate(tensorrt_tensor_nbytes(self.context, self.owner.engine, name))
-            for name in ("hidden", "input_pos", "mask")
-        }
-        self.output = arena.allocate(
-            tensorrt_tensor_nbytes(
-                self.context,
-                self.owner.engine,
-                "output",
-            )
-        )
-        self.next_state = {}
-        self.state_nbytes = {}
-        for name in state:
-            output_name = f"next_{name}"
-            input_shape = tuple(self.context.get_tensor_shape(name))
-            output_shape = tuple(self.context.get_tensor_shape(output_name))
-            input_dtype = self.owner.engine.get_tensor_dtype(name)
-            output_dtype = self.owner.engine.get_tensor_dtype(output_name)
-            input_size = tensorrt_tensor_nbytes(self.context, self.owner.engine, name)
-            output_size = tensorrt_tensor_nbytes(self.context, self.owner.engine, output_name)
-            expected_size, expected_dtype = state_specs[name]
-            if (
-                input_shape != output_shape
-                or input_size != expected_size
-                or output_size != expected_size
-                or input_dtype != expected_dtype
-                or output_dtype != expected_dtype
-            ):
-                raise ValueError(
-                    f"temp prefill state mismatch for {name}: "
-                    f"input={input_shape}/{input_size}, "
-                    f"output={output_shape}/{output_size}, runtime={expected_size}"
-                )
-            self.state_nbytes[name] = output_size
-            self.next_state[name] = arena.allocate(output_size)
-        bindings = {**self.inputs, "output": self.output}
-        for name, pointer in state.items():
-            bindings[name] = pointer
-            bindings[f"next_{name}"] = self.next_state[name]
-        for name, pointer in bindings.items():
-            if not self.context.set_tensor_address(name, pointer):
-                raise RuntimeError(f"failed to bind temp prefill tensor {name}")
-        self.calls = 0
-
-    def run(self, hidden_bf16: np.ndarray) -> None:
-        hidden_bf16 = np.ascontiguousarray(hidden_bf16)
-        if hidden_bf16.dtype != np.uint16:
-            raise TypeError(
-                "temp prefill hidden must contain raw bfloat16 words as uint16, "
-                f"got {hidden_bf16.dtype}"
-            )
-        if hidden_bf16.shape != self.shapes["hidden"]:
-            raise ValueError(
-                "temp prefill hidden shape mismatch: "
-                f"{hidden_bf16.shape} != {self.shapes['hidden']}"
-            )
-        positions = np.repeat(
-            np.arange(self.sequence_length, dtype=np.int64)[None],
-            2,
-            axis=0,
-        )
-        rows = positions[:, :, None]
-        columns = np.arange(2048, dtype=np.int64)[None, None]
-        mask = np.ascontiguousarray(columns <= rows, dtype=np.bool_)
-        copy_to_device(self.inputs["hidden"], hidden_bf16)
-        copy_to_device(self.inputs["input_pos"], positions)
-        copy_to_device(self.inputs["mask"], mask)
-        if not self.context.execute_async_v3(self.stream):
-            raise RuntimeError("temp prefill TensorRT enqueue failed")
-        for name, destination in self.state.items():
-            cuda_check(
-                cudart.cudaMemcpyAsync(
-                    destination,
-                    self.next_state[name],
-                    self.state_nbytes[name],
-                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
-                    self.stream,
-                ),
-                f"cudaMemcpyAsync(D2D temp prefill state {name})",
-            )
-        cuda_check(cudart.cudaStreamSynchronize(self.stream), "temp prefill synchronize")
-        self.calls += 1
-
-
 class PhoneEncoder:
     def __init__(self, path: Path, stream: int, arena: CudaArena) -> None:
         self.owner = EngineOwner(path)
@@ -412,6 +232,207 @@ class PhoneEncoder:
         return download_array(self.pointers["phone_embeddings"], np.uint16, output_shape)
 
 
+def tensorrt_dtype_itemsize(dtype: trt.DataType) -> int:
+    return {
+        trt.DataType.BOOL: 1,
+        trt.DataType.BF16: 2,
+        trt.DataType.HALF: 2,
+        trt.DataType.FLOAT: 4,
+        trt.DataType.INT32: 4,
+        trt.DataType.INT64: 8,
+    }[dtype]
+
+
+def tensorrt_tensor_nbytes(context, engine, name: str) -> int:
+    shape = tuple(context.get_tensor_shape(name))
+    if any(dimension < 0 for dimension in shape):
+        raise RuntimeError(f"unresolved TensorRT shape {name}={shape}")
+    return int(np.prod(shape, dtype=np.int64)) * tensorrt_dtype_itemsize(
+        engine.get_tensor_dtype(name)
+    )
+
+
+def runtime_state_dtype(value: np.ndarray) -> trt.DataType:
+    if value.dtype == np.uint16:
+        return trt.DataType.BF16
+    if value.dtype == np.int64:
+        return trt.DataType.INT64
+    raise TypeError(f"unsupported temporal state dtype: {value.dtype}")
+
+
+def sequence_profile(engine, sequence_length: int) -> int | None:
+    """Return the exact optimization profile for q, or None for a static plan."""
+
+    hidden_shape = tuple(engine.get_tensor_shape("hidden"))
+    if -1 not in hidden_shape:
+        if len(hidden_shape) != 3 or hidden_shape[1] != sequence_length:
+            raise ValueError(
+                f"TensorRT plan has static hidden shape {hidden_shape}, "
+                f"not q={sequence_length}"
+            )
+        return None
+    matches = []
+    for index in range(engine.num_optimization_profiles):
+        minimum, optimum, maximum = engine.get_tensor_profile_shape("hidden", index)
+        if (
+            minimum[1] <= sequence_length <= maximum[1]
+            and optimum[1] == sequence_length
+        ):
+            matches.append(index)
+    if not matches:
+        raise ValueError(f"TensorRT plan has no exact profile for q={sequence_length}")
+    return matches[0]
+
+
+def create_temp_context(engine, stream: int, sequence_length: int):
+    context = engine.create_execution_context()
+    if context is None:
+        raise RuntimeError("failed to create temporal TensorRT execution context")
+    profile = sequence_profile(engine, sequence_length)
+    if profile is not None:
+        if not context.set_optimization_profile_async(profile, stream):
+            raise RuntimeError(f"failed to select temporal profile {profile}")
+        shapes = {
+            "hidden": (2, sequence_length, 1024),
+            "input_pos": (2, sequence_length),
+            "mask": (2, sequence_length, 2048),
+        }
+        for name, shape in shapes.items():
+            if not context.set_input_shape(name, shape):
+                raise RuntimeError(f"failed to set temporal input shape {name}={shape}")
+    return context, profile
+
+
+class UnifiedTempReplay:
+    """Use q=420 from the hot temporal plan without loading duplicate weights."""
+
+    backend = "tensorrt_unified"
+
+    def __init__(
+        self,
+        owner: EngineOwner,
+        stream: int,
+        arena: CudaArena,
+        state: dict[str, int],
+        state_specs: dict[str, np.ndarray],
+        replay_length: int,
+    ) -> None:
+        self.owner = owner
+        self.stream = stream
+        self.state = state
+        self.replay_length = replay_length
+        self.chunk_length = replay_length
+        self.context, self.profile = create_temp_context(
+            owner.engine, stream, replay_length
+        )
+        self.shapes = {
+            name: tuple(self.context.get_tensor_shape(name))
+            for name in ("hidden", "input_pos", "mask")
+        }
+        expected_inputs = {
+            "hidden": (2, replay_length, 1024),
+            "input_pos": (2, replay_length),
+            "mask": (2, replay_length, 2048),
+        }
+        if self.shapes != expected_inputs:
+            raise ValueError(
+                f"unexpected unified replay inputs: {self.shapes} != {expected_inputs}"
+            )
+
+        input_names = {
+            owner.engine.get_tensor_name(index)
+            for index in range(owner.engine.num_io_tensors)
+            if owner.engine.get_tensor_mode(owner.engine.get_tensor_name(index))
+            == trt.TensorIOMode.INPUT
+        }
+        output_names = {
+            owner.engine.get_tensor_name(index)
+            for index in range(owner.engine.num_io_tensors)
+            if owner.engine.get_tensor_mode(owner.engine.get_tensor_name(index))
+            == trt.TensorIOMode.OUTPUT
+        }
+        expected_state_outputs = {f"next_{name}" for name in state}
+        expected_input_names = {"hidden", "input_pos", "mask", *state}
+        expected_output_names = {"output", "semantic_logits", *expected_state_outputs}
+        if input_names != expected_input_names or output_names != expected_output_names:
+            raise ValueError(
+                "unified temporal engine I/O mismatch: "
+                f"missing_inputs={sorted(expected_input_names - input_names)}, "
+                f"extra_inputs={sorted(input_names - expected_input_names)}, "
+                f"missing_outputs={sorted(expected_output_names - output_names)}, "
+                f"extra_outputs={sorted(output_names - expected_output_names)}"
+            )
+
+        self.inputs = {
+            name: arena.allocate(
+                tensorrt_tensor_nbytes(self.context, owner.engine, name)
+            )
+            for name in ("hidden", "input_pos", "mask")
+        }
+        self.discarded_outputs = {
+            name: arena.allocate(
+                tensorrt_tensor_nbytes(self.context, owner.engine, name)
+            )
+            for name in ("output", "semantic_logits")
+        }
+        for name, value in state_specs.items():
+            input_shape = tuple(self.context.get_tensor_shape(name))
+            output_name = f"next_{name}"
+            output_shape = tuple(self.context.get_tensor_shape(output_name))
+            expected_shape = tuple(value.shape)
+            expected_dtype = runtime_state_dtype(value)
+            if (
+                input_shape != expected_shape
+                or output_shape != expected_shape
+                or owner.engine.get_tensor_dtype(name) != expected_dtype
+                or owner.engine.get_tensor_dtype(output_name) != expected_dtype
+            ):
+                raise ValueError(
+                    f"unified temporal state mismatch for {name}: "
+                    f"input={input_shape}, output={output_shape}, expected={expected_shape}"
+                )
+
+        bindings = {**self.inputs, **self.discarded_outputs}
+        for name, pointer in state.items():
+            bindings[name] = pointer
+            # The q=1 plan already uses this in-place state ABI. q=420 keeps
+            # the same full-cache output contract, so both contexts share the
+            # persistent buffers without a second 192 MiB state bank.
+            bindings[f"next_{name}"] = pointer
+        for name, pointer in bindings.items():
+            if not self.context.set_tensor_address(name, pointer):
+                raise RuntimeError(f"failed to bind unified temporal tensor {name}")
+
+        positions = np.arange(replay_length, dtype=np.int64)
+        self.positions = np.repeat(positions[None], 2, axis=0)
+        columns = np.arange(2048, dtype=np.int64)[None, None]
+        self.mask = np.ascontiguousarray(
+            columns <= self.positions[:, :, None], dtype=np.bool_
+        )
+        self.calls = 0
+        self.replays = 0
+
+    def run(self, hidden_bf16: np.ndarray) -> None:
+        hidden_bf16 = np.ascontiguousarray(hidden_bf16)
+        expected_shape = (2, self.replay_length, 1024)
+        if hidden_bf16.dtype != np.uint16 or hidden_bf16.shape != expected_shape:
+            raise ValueError(
+                "unified temporal replay hidden must be raw bfloat16 words with "
+                f"shape {expected_shape}, got {hidden_bf16.dtype}/{hidden_bf16.shape}"
+            )
+        copy_to_device(self.inputs["hidden"], hidden_bf16)
+        copy_to_device(self.inputs["input_pos"], self.positions)
+        copy_to_device(self.inputs["mask"], self.mask)
+        if not self.context.execute_async_v3(self.stream):
+            raise RuntimeError("unified temporal replay TensorRT enqueue failed")
+        cuda_check(
+            cudart.cudaStreamSynchronize(self.stream),
+            "unified temporal replay synchronize",
+        )
+        self.calls += 1
+        self.replays += 1
+
+
 class TempDecoder:
     def __init__(
         self,
@@ -419,12 +440,13 @@ class TempDecoder:
         bundle: RawBundle,
         stream: int,
         arena: CudaArena,
-        prefill_path: Path | None = None,
     ) -> None:
-        self.owner = EngineOwner(path)
-        self.context = self.owner.engine.create_execution_context()
         self.stream = stream
         self.arena = arena
+        self.owner = EngineOwner(path)
+        self.context, self.hot_profile = create_temp_context(
+            self.owner.engine, stream, 1
+        )
         self.state_names = tuple(bundle.manifest["prefill_buffer_names"])
         self.state = {}
         self.initial = {}
@@ -440,9 +462,7 @@ class TempDecoder:
                 if not name.endswith("kv_cache.cache_pos"):
                     raise TypeError(f"unexpected temporal int64 state: {name}")
                 empty = np.arange(value.size, dtype=np.int64).reshape(value.shape)
-                template = arena.allocate(max(empty.nbytes, 1))
-                copy_to_device(template, empty)
-                self.empty_cache_pos[tensor_name] = (template, empty.nbytes)
+                self.empty_cache_pos[tensor_name] = empty
         self.hidden = arena.allocate(2 * 1 * 1024 * 2)
         self.position = arena.allocate(2 * 1 * 8)
         self.mask = arena.allocate(2 * 1 * 2048)
@@ -467,7 +487,6 @@ class TempDecoder:
         self.graph_launches = 0
         self.sink_rebuilds = 0
         self.sink_replay_steps = 0
-        self.sink_prefill_calls = 0
         self.sink_rebuild_seconds = 0.0
         config = bundle.manifest["config"]
         self.audio_window_size = int(
@@ -480,36 +499,31 @@ class TempDecoder:
             )
         else:
             self.sink_attention = None
-        self.prefill = None
-        if prefill_path is not None:
-            self.attach_prefill(prefill_path)
+        self.replay = None
 
-    def attach_prefill(
-        self,
-        path: Path,
-    ) -> None:
-        if self.prefill is not None:
-            raise RuntimeError("temp prefill engine is already attached")
+    def supports_unified_replay(self) -> bool:
         if self.sink_attention is None:
-            raise ValueError("temp prefill engine requires prefill.hidden in runtime assets")
-        state_specs = {
-            name: (value.nbytes, runtime_state_dtype(value))
-            for name, value in self.initial.items()
-        }
-        prefill = TempPrefill(
-            path,
+            return False
+        replay_length = self.sink_attention.prompt_length + self.sink_attention.tail_limit
+        try:
+            return sequence_profile(self.owner.engine, replay_length) is not None
+        except ValueError:
+            return False
+
+    def attach_unified_replay(self) -> None:
+        if self.replay is not None:
+            raise RuntimeError("temp replay engine is already attached")
+        if self.sink_attention is None:
+            raise ValueError("unified replay requires prefill.hidden in runtime assets")
+        replay_length = self.sink_attention.prompt_length + self.sink_attention.tail_limit
+        self.replay = UnifiedTempReplay(
+            self.owner,
             self.stream,
             self.arena,
             self.state,
-            state_specs,
+            self.initial,
+            replay_length,
         )
-        expected_length = self.sink_attention.prompt_length + self.sink_attention.tail_limit
-        if prefill.sequence_length != expected_length:
-            raise ValueError(
-                "temp prefill sequence length does not match sink history: "
-                f"{prefill.sequence_length} != {expected_length}"
-            )
-        self.prefill = prefill
 
     def step(self, hidden_bf16: np.ndarray, position: int) -> tuple[np.ndarray, np.ndarray]:
         if self.sink_attention is None:
@@ -565,16 +579,8 @@ class TempDecoder:
         # Every visible K/V slot is overwritten by the replay. Keeping words in
         # masked slots avoids copying 192 MiB only to clear them. cache_pos is
         # the state that controls where each replayed token is written.
-        for name, (template, size) in self.empty_cache_pos.items():
-            cuda_check(
-                cudart.cudaMemcpy(
-                    self.state[name],
-                    template,
-                    size,
-                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToDevice,
-                ),
-                f"cudaMemcpy(D2D reset {name})",
-            )
+        for name, value in self.empty_cache_pos.items():
+            copy_to_device(self.state[name], value)
 
     def _rebuild_cache(self, global_position: int) -> None:
         if self.sink_attention is None:
@@ -582,7 +588,7 @@ class TempDecoder:
         started = time.perf_counter()
         replay_hidden = self.sink_attention.rebuild_sequence(global_position)
         self._reset_empty_cache()
-        if self.prefill is None:
+        if self.replay is None:
             for position in range(replay_hidden.shape[1]):
                 self._execute(
                     replay_hidden[:, position : position + 1],
@@ -590,8 +596,7 @@ class TempDecoder:
                     readback=False,
                 )
         else:
-            self.prefill.run(replay_hidden)
-            self.sink_prefill_calls += 1
+            self.replay.run(replay_hidden)
         self.sink_rebuilds += 1
         self.sink_replay_steps += int(replay_hidden.shape[1])
         self.sink_rebuild_seconds += time.perf_counter() - started
@@ -1204,7 +1209,6 @@ class RuntimeFiles:
     mimi_state: Path
     audio_embedding_weight: Path
     audio_embedding_cubin: Path
-    temp_prefill_engine: Path | None = None
     cuda_acoustic_control_cubin: Path | None = None
 
     @classmethod
@@ -1212,7 +1216,6 @@ class RuntimeFiles:
         return cls(
             assets=args.assets,
             temp_engine=args.temp_engine,
-            temp_prefill_engine=args.temp_prefill_engine,
             dep_engine=args.dep_engine,
             phone_engine=args.phone_engine,
             mimi_engine=args.mimi_engine,
@@ -1318,7 +1321,12 @@ class SynthesisRuntime:
         self.request_count = 0
         try:
             self.phone = PhoneEncoder(files.phone_engine, self.cuda_stream, self.arena)
-            self.temp = TempDecoder(files.temp_engine, self.bundle, self.cuda_stream, self.arena)
+            self.temp = TempDecoder(
+                files.temp_engine,
+                self.bundle,
+                self.cuda_stream,
+                self.arena,
+            )
             self.dep = DepDecoder(files.dep_engine, self.cuda_stream, self.arena)
             self.mimi = MimiDecoder(
                 files.mimi_engine,
@@ -1344,8 +1352,10 @@ class SynthesisRuntime:
                     self.acoustic_control,
                     self.embeddings.core.weight_pointer,
                 )
-            if files.temp_prefill_engine is not None:
-                self.temp.attach_prefill(files.temp_prefill_engine)
+            # Allocate the cold replay context only after the hot CUDA graphs
+            # have stable addresses. Both contexts share one TensorRT plan.
+            if self.temp.supports_unified_replay():
+                self.temp.attach_unified_replay()
         except BaseException:
             self._close_resources()
             raise
@@ -1499,8 +1509,10 @@ class SynthesisRuntime:
                 "temp_cuda_graph": self.temp.graph_launches,
                 "temp_sink_rebuilds": self.temp.sink_rebuilds,
                 "temp_sink_replay_steps": self.temp.sink_replay_steps,
-                "temp_sink_prefill_calls": self.temp.sink_prefill_calls,
                 "temp_sink_rebuild_seconds": self.temp.sink_rebuild_seconds,
+                "temp_replay_calls": (
+                    self.temp.replay.calls if self.temp.replay is not None else 0
+                ),
                 "dep_q2": self.dep.calls[2],
                 "dep_q1": self.dep.calls[1],
                 "mimi": self.mimi.calls,
@@ -1710,8 +1722,10 @@ class SynthesisRuntime:
                 "temp_sink_replay": (
                     self.temp.sink_replay_steps - call_start["temp_sink_replay_steps"]
                 ),
-                "temp_sink_prefill": (
-                    self.temp.sink_prefill_calls - call_start["temp_sink_prefill_calls"]
+                "temp_replay": (
+                    (self.temp.replay.calls - call_start["temp_replay_calls"])
+                    if self.temp.replay is not None
+                    else 0
                 ),
                 "dep_q2": self.dep.calls[2] - call_start["dep_q2"],
                 "dep_q1": self.dep.calls[1] - call_start["dep_q1"],
@@ -1793,16 +1807,20 @@ class SynthesisRuntime:
                         self.temp.sink_replay_steps
                         - call_start["temp_sink_replay_steps"]
                     ),
-                    "backend": (
-                        "batched-prefill" if self.temp.prefill is not None else "q1-replay"
-                    ),
-                    "prefill_calls": (
-                        self.temp.sink_prefill_calls - call_start["temp_sink_prefill_calls"]
-                    ),
                     "rebuild_seconds": round(
                         self.temp.sink_rebuild_seconds
                         - call_start["temp_sink_rebuild_seconds"],
                         3,
+                    ),
+                    "replay_backend": (
+                        self.temp.replay.backend
+                        if self.temp.replay is not None
+                        else "q1"
+                    ),
+                    "chunk_length": (
+                        self.temp.replay.chunk_length
+                        if self.temp.replay is not None
+                        else 1
                     ),
                 },
                 "teacher_forced": {
