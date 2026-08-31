@@ -29,6 +29,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cuda-acoustic-control-cubin", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=20260830)
     parser.add_argument("--max-frames", type=int, default=900)
+    parser.add_argument(
+        "--include-trajectory",
+        action="store_true",
+        help="Store generated Mimi codes and frame metadata for decoder isolation.",
+    )
     return parser.parse_args()
 
 
@@ -73,7 +78,7 @@ def main() -> None:
             baseline_path,
             seed=args.seed,
             max_frames=args.max_frames,
-            include_trajectory=False,
+            include_trajectory=args.include_trajectory,
         )
         runtime.temp.prefill = prefill
         candidate = runtime.synthesize_to_wav(
@@ -81,7 +86,7 @@ def main() -> None:
             candidate_path,
             seed=args.seed,
             max_frames=args.max_frames,
-            include_trajectory=False,
+            include_trajectory=args.include_trajectory,
         )
 
     baseline_pcm, sample_rate = read_pcm(baseline_path)

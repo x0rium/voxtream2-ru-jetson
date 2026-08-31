@@ -87,6 +87,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use captured tokens only as next-step inputs and report model parity.",
     )
+    parser.add_argument(
+        "--include-trajectory",
+        action="store_true",
+        help="Store per-frame generated codes and alignment metadata in metrics JSON.",
+    )
     return parser.parse_args()
 
 
@@ -1724,6 +1729,8 @@ class SynthesisRuntime:
                 "torch_imported": False,
                 "resident": True,
                 "request_index": request_index,
+                "seed": seed,
+                "max_frames": max_frames,
                 "text": result_text,
                 "frames": len(frame_times),
                 "audio_frames": audio_frames,
@@ -1873,6 +1880,7 @@ def main() -> None:
             max_frames=args.max_frames,
             allow_unknown_phones=args.allow_unknown_phones,
             teacher_force_reference=args.teacher_force_reference,
+            include_trajectory=args.include_trajectory,
         )
     metrics_path.write_text(json.dumps(result, ensure_ascii=False, indent=2))
     print(json.dumps(result, ensure_ascii=False, indent=2))
