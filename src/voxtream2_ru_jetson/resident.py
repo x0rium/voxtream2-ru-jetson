@@ -118,7 +118,7 @@ def serve_jsonl(runtime, source: TextIO, sink: BinaryIO) -> None:
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("request.text must be a non-empty string")
             seed = int(request.get("seed", 20260830))
-            max_frames = int(request.get("max_frames", 256))
+            max_frames = int(request.get("max_frames", 1024))
             if max_frames < 2:
                 raise ValueError("request.max_frames must be at least 2")
             write_json_record(

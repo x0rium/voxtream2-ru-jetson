@@ -303,6 +303,57 @@ class FrontendResult:
     unknown_phones: tuple[str, ...]
 
 
+class PhoneSequenceTooLongError(ValueError):
+    """The normalized phone sequence does not fit the TensorRT profile."""
+
+    def __init__(self, actual: int, maximum: int) -> None:
+        self.actual = int(actual)
+        self.maximum = int(maximum)
+        super().__init__(
+            "text frontend produced a phone sequence longer than the "
+            f"TensorRT profile: {self.actual} > {self.maximum}"
+        )
+
+
+def split_text_at_natural_boundary(text: str) -> tuple[str, str]:
+    """Split text near its middle, preferring a complete sentence or clause."""
+
+    text = text.strip()
+    if not text:
+        raise ValueError("cannot split empty text")
+    midpoint = len(text) / 2
+    candidates: list[tuple[int, float, int]] = []
+    for match in re.finditer(r"\s+", text):
+        position = match.end()
+        left = text[: match.start()].rstrip()
+        right = text[position:].lstrip()
+        if not left or not right:
+            continue
+        tail = left[-2:]
+        if "\n" in match.group() or left[-1] in ".!?…":
+            priority = 0
+        elif left[-1] in "»”\"'" and len(tail) == 2 and tail[0] in ".!?…":
+            priority = 0
+        elif left[-1] in ",;:—–-":
+            priority = 1
+        else:
+            priority = 2
+        candidates.append((priority, abs(position - midpoint), position))
+    if not candidates:
+        raise ValueError("text has no safe whitespace boundary")
+    central = [
+        candidate
+        for candidate in candidates
+        if len(text) * 0.2 <= candidate[2] <= len(text) * 0.8
+    ]
+    _, _, position = min(central or candidates)
+    left = text[:position].strip()
+    right = text[position:].strip()
+    if not left or not right or max(len(left), len(right)) >= len(text):
+        raise ValueError("text split did not make progress")
+    return left, right
+
+
 class TorchlessRussianFrontend:
     def __init__(
         self,
@@ -446,10 +497,9 @@ class TorchlessRussianFrontend:
         if prompt_prefix.ndim != 1:
             raise ValueError("prompt phone prefix must be one-dimensional")
         if prompt_prefix.size + generated_array.size > max_sequence:
-            raise ValueError(
-                "text frontend produced a phone sequence longer than the "
-                f"TensorRT profile: {prompt_prefix.size + generated_array.size} "
-                f"> {max_sequence}"
+            raise PhoneSequenceTooLongError(
+                prompt_prefix.size + generated_array.size,
+                max_sequence,
             )
         conditional = np.concatenate([prompt_prefix, generated_array])
         unconditional = np.concatenate(

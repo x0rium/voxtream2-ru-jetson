@@ -102,6 +102,12 @@ class ResidentProtocolTests(unittest.TestCase):
         self.assertEqual(records[-1][0], DONE)
         self.assertEqual(json.loads(records[-1][1])["id"], "good")
 
+    def test_default_frame_limit_covers_a_full_phone_segment(self):
+        runtime = FakeRuntime()
+        serve_jsonl(runtime, io.StringIO('{"text":"Длинная проверка"}\n'), io.BytesIO())
+
+        self.assertEqual(runtime.requests[0][1]["max_frames"], 1024)
+
     def test_truncated_record_is_rejected(self):
         with self.assertRaisesRegex(EOFError, "truncated resident record header"):
             list(iter_records(io.BytesIO(b"P\x05")))

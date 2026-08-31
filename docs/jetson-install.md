@@ -26,10 +26,10 @@ dpkg-query -W nvidia-jetpack 'libnvinfer*' 2>/dev/null
 /usr/local/cuda/bin/nvcc --version
 ```
 
-Проверенная версия кода — `v0.2.1`:
+Проверенная версия кода — `v0.2.2`:
 
 ```bash
-git clone --branch v0.2.1 --depth 1 \
+git clone --branch v0.2.2 --depth 1 \
   https://github.com/x0rium/voxtream2-ru-jetson.git
 cd voxtream2-ru-jetson
 ```
@@ -61,7 +61,7 @@ python3 -m venv .venv-hf
 . .venv-hf/bin/activate
 python3 -m pip install 'huggingface_hub>=1.0,<2'
 hf download x0rium/voxtream2-ru-jetson-onnx \
-  --revision v0.2.1 \
+  --revision v0.2.2 \
   --local-dir release
 deactivate
 
@@ -95,6 +95,14 @@ docker run --rm --runtime nvidia --network none \
   --optimization-level 1 \
   --metrics artifacts/build-metrics/phone-encoder.json
 ```
+
+Максимум 640 выбран как конечная верхняя граница одного TensorRT optimization
+profile на Jetson, а не как предел длительности TTS. Phone encoder обрабатывает
+каждый сегмент целиком, поэтому TensorRT требует конкретный `MAX` для выбора
+тактик и планирования памяти. Если нормализованный текст не помещается в один
+сегмент, runtime автоматически делит его по естественным границам и продолжает
+выдавать один PCM-поток. Пересобирать engine для обычных длинных текстов не
+нужно.
 
 Соберите единый temporal plan. Профиль q=1 обслуживает обычный шаг генерации,
 q=420 — восстановление sink-attention после заполнения окна:

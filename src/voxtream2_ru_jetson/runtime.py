@@ -26,7 +26,11 @@ from cuda import cudart
 
 from .cuda_acoustic_control import CudaAcousticControl
 from .cuda_audio_embedding import CudaAudioEmbeddingCore
-from .frontend import TorchlessRussianFrontend
+from .frontend import (
+    PhoneSequenceTooLongError,
+    TorchlessRussianFrontend,
+    split_text_at_natural_boundary,
+)
 from .sink_attention import SinkAttentionConfig, SinkAttentionHistory
 from .tensorrt_standalone import CudaArena, cuda_check
 
@@ -73,7 +77,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--metrics", type=Path)
     parser.add_argument("--seed", type=int, default=20260830)
-    parser.add_argument("--max-frames", type=int, default=256)
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=1024,
+        help="Safety limit for each generated text segment (default: 1024).",
+    )
     parser.add_argument(
         "--teacher-force-reference",
         action="store_true",
@@ -1427,7 +1436,7 @@ class SynthesisRuntime:
         text: str | None,
         *,
         seed: int = 20260830,
-        max_frames: int = 256,
+        max_frames: int = 1024,
         allow_unknown_phones: bool = False,
         teacher_force_reference: bool = False,
         include_trajectory: bool = True,
@@ -1443,7 +1452,7 @@ class SynthesisRuntime:
         self._active = True
         request_index = self.request_count
         self.request_count += 1
-        iterator = self._generate(
+        iterator = self._generate_request(
             text=text,
             seed=seed,
             max_frames=max_frames,
@@ -1453,6 +1462,292 @@ class SynthesisRuntime:
             request_index=request_index,
         )
         return SynthesisStream(iterator, self._release_request)
+
+    def _generate_request(
+        self,
+        *,
+        text: str | None,
+        seed: int,
+        max_frames: int,
+        allow_unknown_phones: bool,
+        teacher_force_reference: bool,
+        include_trajectory: bool,
+        request_index: int,
+    ) -> Generator[bytes, None, dict[str, object]]:
+        request_started = time.perf_counter()
+        first_pcm_at = None
+        segmentation_metrics = {
+            "split_operations": 0,
+            "overflow_probe_seconds": 0.0,
+        }
+        iterator = self._generate_fitting_segments(
+            text=text,
+            seed=seed,
+            max_frames=max_frames,
+            allow_unknown_phones=allow_unknown_phones,
+            teacher_force_reference=teacher_force_reference,
+            include_trajectory=include_trajectory,
+            request_index=request_index,
+            segmentation_metrics=segmentation_metrics,
+        )
+        exhausted = False
+        try:
+            while True:
+                try:
+                    pcm_chunk = next(iterator)
+                except StopIteration as finished:
+                    segment_results = finished.value
+                    exhausted = True
+                    break
+                if first_pcm_at is None:
+                    first_pcm_at = time.perf_counter()
+                yield pcm_chunk
+        finally:
+            if not exhausted:
+                iterator.close()
+        if len(segment_results) == 1:
+            return segment_results[0]
+        if text is None or first_pcm_at is None:
+            raise RuntimeError("segmented generation completed without dynamic text or PCM")
+        return self._aggregate_segment_results(
+            text=text,
+            segment_results=segment_results,
+            request_started=request_started,
+            first_pcm_at=first_pcm_at,
+            request_index=request_index,
+            seed=seed,
+            max_frames=max_frames,
+            segmentation_metrics=segmentation_metrics,
+        )
+
+    def _generate_fitting_segments(
+        self,
+        *,
+        text: str | None,
+        seed: int,
+        max_frames: int,
+        allow_unknown_phones: bool,
+        teacher_force_reference: bool,
+        include_trajectory: bool,
+        request_index: int,
+        segmentation_metrics: dict[str, int | float],
+    ) -> Generator[bytes, None, list[dict[str, object]]]:
+        attempt_started = time.perf_counter()
+        try:
+            result = yield from self._generate(
+                text=text,
+                seed=seed,
+                max_frames=max_frames,
+                allow_unknown_phones=allow_unknown_phones,
+                teacher_force_reference=teacher_force_reference,
+                include_trajectory=include_trajectory,
+                request_index=request_index,
+                release_request=False,
+            )
+            return [result]
+        except PhoneSequenceTooLongError as error:
+            segmentation_metrics["split_operations"] += 1
+            segmentation_metrics["overflow_probe_seconds"] += (
+                time.perf_counter() - attempt_started
+            )
+            if text is None:
+                raise
+            try:
+                left, right = split_text_at_natural_boundary(text)
+            except ValueError:
+                raise error
+            results: list[dict[str, object]] = []
+            for segment in (left, right):
+                child_results = yield from self._generate_fitting_segments(
+                    text=segment,
+                    seed=seed,
+                    max_frames=max_frames,
+                    allow_unknown_phones=allow_unknown_phones,
+                    teacher_force_reference=teacher_force_reference,
+                    include_trajectory=include_trajectory,
+                    request_index=request_index,
+                    segmentation_metrics=segmentation_metrics,
+                )
+                results.extend(child_results)
+            return results
+
+    def _aggregate_segment_results(
+        self,
+        *,
+        text: str,
+        segment_results: list[dict[str, object]],
+        request_started: float,
+        first_pcm_at: float,
+        request_index: int,
+        seed: int,
+        max_frames: int,
+        segmentation_metrics: dict[str, int | float],
+    ) -> dict[str, object]:
+        total_frames = sum(int(item["frames"]) for item in segment_results)
+        total_audio_frames = sum(int(item["audio_frames"]) for item in segment_results)
+        audio_seconds = total_audio_frames * self.samples_per_chunk / self.sample_rate
+        generation_seconds = sum(
+            float(item["generation_seconds"]) for item in segment_results
+        )
+        calls = {
+            key: sum(int(item["calls"][key]) for item in segment_results)
+            for key in segment_results[0]["calls"]
+        }
+        frontend_segments = [item["frontend"] for item in segment_results]
+        frontend = {
+            "backend": frontend_segments[0]["backend"],
+            "segmented": True,
+            "normalized_text": " ".join(
+                str(item["normalized_text"]) for item in frontend_segments
+            ),
+            "accented_text": " ".join(
+                str(item["accented_text"]) for item in frontend_segments
+            ),
+            "phonemes": " ".join(str(item["phonemes"]) for item in frontend_segments),
+            "unknown_phones": sorted(
+                {
+                    phone
+                    for item in frontend_segments
+                    for phone in item["unknown_phones"]
+                }
+            ),
+            "phone_tokens_shapes": [
+                item["phone_tokens_shape"] for item in frontend_segments
+            ],
+            "phone_seq_len": sum(int(item["phone_seq_len"]) for item in frontend_segments),
+            "max_segment_phone_seq_len": max(
+                int(item["phone_seq_len"]) for item in frontend_segments
+            ),
+            "resident_load_seconds": frontend_segments[0]["resident_load_seconds"],
+            "process_seconds": round(
+                sum(float(item["process_seconds"]) for item in frontend_segments),
+                3,
+            ),
+            "reused": request_index > 0,
+            "peak_rss_mib": max(
+                float(item["peak_rss_mib"]) for item in frontend_segments
+            ),
+        }
+        trajectory = []
+        global_frame = 0
+        for segment_index, item in enumerate(segment_results):
+            for point in item["trajectory"]:
+                point = dict(point)
+                point["segment_index"] = segment_index
+                point["segment_frame_index"] = point["index"]
+                point["index"] = global_frame
+                trajectory.append(point)
+                global_frame += 1
+        segment_summaries = [
+            {
+                "index": index,
+                "text": item["text"],
+                "frames": item["frames"],
+                "audio_seconds": item["audio_seconds"],
+                "generation_seconds": item["generation_seconds"],
+                "request_seconds": item["request_seconds"],
+                "rtf": item["rtf"],
+                "frontend": item["frontend"],
+                "sink_attention": item["sink_attention"],
+            }
+            for index, item in enumerate(segment_results)
+        ]
+        frame_ms = {
+            "mean": round(
+                sum(
+                    float(item["frame_ms"]["mean"]) * int(item["frames"])
+                    for item in segment_results
+                )
+                / total_frames,
+                3,
+            ),
+            "p95": max(float(item["frame_ms"]["p95"]) for item in segment_results),
+            "p95_aggregation": "maximum_of_segment_p95",
+            "max": max(float(item["frame_ms"]["max"]) for item in segment_results),
+        }
+        stage_ms = {
+            key: round(
+                sum(
+                    float(item["stage_ms_per_generated_frame"][key])
+                    * int(item["frames"])
+                    for item in segment_results
+                )
+                / total_frames,
+                3,
+            )
+            for key in segment_results[0]["stage_ms_per_generated_frame"]
+        }
+        first = segment_results[0]
+        last_sink = dict(segment_results[-1]["sink_attention"])
+        last_sink.update(
+            {
+                "rebuilds": sum(
+                    int(item["sink_attention"]["rebuilds"])
+                    for item in segment_results
+                ),
+                "replay_steps": sum(
+                    int(item["sink_attention"]["replay_steps"])
+                    for item in segment_results
+                ),
+                "rebuild_seconds": round(
+                    sum(
+                        float(item["sink_attention"]["rebuild_seconds"])
+                        for item in segment_results
+                    ),
+                    3,
+                ),
+            }
+        )
+        request_to_first_audio = first_pcm_at - request_started
+        return {
+            "runtime": first["runtime"],
+            "torch_imported": False,
+            "resident": True,
+            "request_index": request_index,
+            "seed": seed,
+            "max_frames": max_frames,
+            "max_frames_per_segment": max_frames,
+            "text": text,
+            "segmented": True,
+            "segment_count": len(segment_results),
+            "segmentation": {
+                "profile_max_sequence": self.phone.max_sequence,
+                "split_operations": int(segmentation_metrics["split_operations"]),
+                "overflow_probe_seconds": round(
+                    float(segmentation_metrics["overflow_probe_seconds"]),
+                    3,
+                ),
+                "boundary_order": ["sentence", "clause", "whitespace"],
+            },
+            "segments": segment_summaries,
+            "frames": total_frames,
+            "audio_frames": total_audio_frames,
+            "audio_seconds": round(audio_seconds, 3),
+            "generation_seconds": round(generation_seconds, 3),
+            "stream_wall_seconds": round(
+                sum(float(item["stream_wall_seconds"]) for item in segment_results),
+                3,
+            ),
+            "request_seconds": round(time.perf_counter() - request_started, 3),
+            "rtf": round(generation_seconds / audio_seconds, 3),
+            "ttfa_seconds": first["ttfa_seconds"],
+            "request_to_first_audio_seconds": round(request_to_first_audio, 3),
+            "cold_start_to_first_audio_seconds": (
+                round(self.startup_seconds + request_to_first_audio, 3)
+                if request_index == 0
+                else None
+            ),
+            "runtime_startup_seconds": round(self.startup_seconds, 3),
+            "frontend": frontend,
+            "pcm": first["pcm"],
+            "frame_ms": frame_ms,
+            "stage_ms_per_generated_frame": stage_ms,
+            "calls": calls,
+            "sink_attention": last_sink,
+            "teacher_forced": first["teacher_forced"],
+            "trajectory": trajectory,
+            "max_rss_mib": max(float(item["max_rss_mib"]) for item in segment_results),
+        }
 
     def _generate(
         self,
@@ -1464,6 +1759,7 @@ class SynthesisRuntime:
         teacher_force_reference: bool,
         include_trajectory: bool,
         request_index: int,
+        release_request: bool = True,
     ) -> Generator[bytes, None, dict[str, object]]:
         request_started = time.perf_counter()
         frontend_metrics = None
@@ -1840,7 +2136,8 @@ class SynthesisRuntime:
                 raise RuntimeError("PyTorch entered sys.modules during torchless execution")
             return result
         finally:
-            self._release_request()
+            if release_request:
+                self._release_request()
 
     def synthesize_to_wav(
         self,
