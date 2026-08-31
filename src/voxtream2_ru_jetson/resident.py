@@ -162,6 +162,7 @@ def parse_args() -> argparse.Namespace:
         default="ru-normalizr",
     )
     parser.add_argument("--temp-engine", type=Path, required=True)
+    parser.add_argument("--temp-prefill-engine", type=Path)
     parser.add_argument("--dep-engine", type=Path, required=True)
     parser.add_argument("--phone-engine", type=Path, required=True)
     parser.add_argument("--mimi-engine", type=Path, required=True)
@@ -181,6 +182,7 @@ def main() -> None:
     files = RuntimeFiles(
         assets=args.assets,
         temp_engine=args.temp_engine,
+        temp_prefill_engine=args.temp_prefill_engine,
         dep_engine=args.dep_engine,
         phone_engine=args.phone_engine,
         mimi_engine=args.mimi_engine,
